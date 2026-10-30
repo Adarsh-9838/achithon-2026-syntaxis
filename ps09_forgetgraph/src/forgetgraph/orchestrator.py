@@ -20,6 +20,10 @@ class DeletedUserError(ValueError):
     pass
 
 
+class UnknownUserError(ValueError):
+    pass
+
+
 class SimulatedCrash(RuntimeError):
     def __init__(self, deletion_id: str, step_name: str):
         super().__init__(f"Simulated crash after completed step: {step_name}")
@@ -532,6 +536,14 @@ class ForgetGraphOrchestrator:
             ).fetchone()
             if tombstone:
                 return tombstone["deletion_id"], True
+            source_record = connection.execute(
+                "SELECT 1 FROM source_records WHERE user_hash = ?",
+                (user_hash,),
+            ).fetchone()
+            if source_record is None:
+                raise UnknownUserError(
+                    "This ID is not in the active source dataset; no deletion was recorded."
+                )
 
             affected = [
                 row["artifact_id"]

@@ -8,7 +8,11 @@ import streamlit as st
 PROJECT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_DIR / "src"))
 
-from forgetgraph import ForgetGraphOrchestrator, SimulatedCrash  # noqa: E402
+from forgetgraph import (  # noqa: E402
+    ForgetGraphOrchestrator,
+    SimulatedCrash,
+    UnknownUserError,
+)
 
 
 @st.cache_resource
@@ -65,8 +69,14 @@ for column, label, key in zip(
     column.metric(label, counts[key])
 
 st.subheader("Request a deletion")
+st.caption(
+    "Use an ID from the committed dataset, for example user-0001 "
+    "(valid IDs range from user-0000 to user-0699)."
+)
 with st.form("deletion_request"):
-    user_id = st.text_input("Synthetic user ID", placeholder="user-0001")
+    user_id = st.text_input(
+        "Synthetic user ID", placeholder="user-0001 (valid: user-0000 to user-0699)"
+    )
     inject_failure = st.checkbox("Inject a simulated crash after a step")
     failure_step = st.selectbox(
         "Crash after",
@@ -95,6 +105,8 @@ if submitted:
                 f"Workflow {error.deletion_id} is persisted and can be resumed below."
             )
             st.session_state["selected_workflow"] = error.deletion_id
+        except UnknownUserError as error:
+            st.error(str(error))
         else:
             if result.get("already_deleted"):
                 st.info("This identifier is already deleted; no state was changed.")

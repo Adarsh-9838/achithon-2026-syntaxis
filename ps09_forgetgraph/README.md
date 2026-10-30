@@ -32,8 +32,10 @@ streamlit run app.py
 
 The app initializes `data/forgetgraph.sqlite` from the committed
 `data/synthetic_users.csv` on its first run. Use the synthetic ID shown in the
-CSV (for example, `user-0001`). Select the failure-injection checkbox and a
-workflow step to simulate a crash, then use **Resume workflow** to continue.
+CSV (for example, `user-0001`; valid IDs run from `user-0000` to `user-0699`).
+Unknown IDs are rejected without creating a tombstone or workflow. Select the
+failure-injection checkbox and a workflow step to simulate a crash, then use
+**Resume workflow** to continue.
 
 Run the test suite:
 
@@ -57,7 +59,8 @@ python generate_dataset.py
   status and effect count persist transactionally and completed steps are
   skipped on resume.
 - The `tombstones` table stores SHA-256 user-ID hashes. Repeated requests make
-  no database changes; managed ingestion checks tombstones before writing.
+  no database changes; unknown IDs are rejected without creating workflows or
+  tombstones; managed ingestion checks tombstones before writing.
 - `training.py` fits the replacement model; `reference.py` independently fits
   a separate scaler and Ridge model without importing the replacement trainer.
   The verifier checks coefficients, intercept, and retained-user predictions,

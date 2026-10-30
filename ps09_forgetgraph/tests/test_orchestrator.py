@@ -10,6 +10,7 @@ from forgetgraph import (
     DeletedUserError,
     ForgetGraphOrchestrator,
     SimulatedCrash,
+    UnknownUserError,
 )
 
 
@@ -184,6 +185,15 @@ def test_repeated_deletion_is_a_no_op(orchestrator):
 
     assert second["already_deleted"] is True
     assert second["deletion_id"] == first["deletion_id"]
+    assert orchestrator.get_database_counts() == before
+
+
+def test_unknown_user_is_rejected_without_creating_a_workflow(orchestrator):
+    before = orchestrator.get_database_counts()
+
+    with pytest.raises(UnknownUserError, match="not in the active source dataset"):
+        orchestrator.request_deletion("not-a-dataset-user")
+
     assert orchestrator.get_database_counts() == before
 
 

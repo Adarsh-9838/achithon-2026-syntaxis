@@ -63,8 +63,10 @@ from a hard-coded affected-artifact list.
 
 1. Hash the identifier and check `tombstones`. If present, return
    `already_deleted` without writing any row or event.
-2. In one transaction, insert the tombstone, capture the affected artifact
-   IDs and old-model snapshot, create a workflow, and create its ordered steps.
+2. Reject an identifier that is not present in active source records without
+   creating a tombstone or workflow. In one transaction, insert the tombstone,
+   capture the affected artifact IDs and old-model snapshot, create a workflow,
+   and create its ordered steps.
 3. Before each pending step, persist `RUNNING`. In a transaction, apply its
    idempotent handler and mark it `COMPLETED`. On an ordinary handler error,
    persist `FAILED` and mark execution `FAILED`; verification remains
