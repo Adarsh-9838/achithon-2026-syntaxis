@@ -50,8 +50,20 @@ st.markdown(
         border-right: 1px solid #23344c;
     }
     [data-testid="stSidebar"] * { color: #e8eef8; }
-    [data-testid="stSidebar"] [data-testid="stMetricLabel"] { color: #aab9ce; }
-    [data-testid="stSidebar"] [data-testid="stMetricValue"] { color: #ffffff; }
+    [data-testid="stSidebar"] [data-testid="stMetric"] {
+        background: #1b2b43;
+        border: 1px solid #2d4260;
+        padding: 12px 14px;
+        box-shadow: none;
+    }
+    [data-testid="stSidebar"] [data-testid="stMetricLabel"],
+    [data-testid="stSidebar"] [data-testid="stMetricLabel"] p {
+        color: #b6c6dc !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stMetricValue"],
+    [data-testid="stSidebar"] [data-testid="stMetricValue"] div {
+        color: #ffffff !important;
+    }
     .block-container { max-width: 1440px; padding-top: 2rem; padding-bottom: 3rem; }
     h1, h2, h3 { color: var(--fg-ink); letter-spacing: -.025em; }
     h1 { font-size: 2.45rem; font-weight: 750; }
