@@ -20,16 +20,16 @@ This repository contains ten independent hackathon problem statements in the top
 
 | ID | Problem title | Specification |
 |---|---|---|
-| `PS01` | Add title from the problem statement | See `PS01/` |
-| `PS02` | Add title from the problem statement | See `PS02/` |
-| `PS03` | Add title from the problem statement | See `PS03/` |
-| `PS04` | Add title from the problem statement | See `PS04/` |
-| `PS05` | Add title from the problem statement | See `PS05/` |
-| `PS06` | Add title from the problem statement | See `PS06/` |
-| `PS07` | Add title from the problem statement | See `PS07/` |
-| `PS08` | Add title from the problem statement | See `PS08/` |
-| `PS09` | Add title from the problem statement | See `PS09/` |
-| `PS10` | Add title from the problem statement | See `PS10/` |
+| `PS01` | Explainable Application Privacy and Permission Analyzer | See `PS01.md` |
+| `PS02` | Automated Invoice and Payment Reconciliation Dashboard | See `PS02.md` |
+| `PS03` | Targeted Model-Repair and Regression-Evaluation Pipeline | See `PS03.md` |
+| `PS04` | Offline-First Multimodal AI Assistant for Healthcare | See `PS04.md` |
+| `PS05` | Automated Multi-Agent Codebase Vulnerability and Dependency Graph Auditor | See `PS05.md` |
+| `PS06` | FAIRSHIFT: Auditable Allocation and Decision-Support System | See `PS06.md` |
+| `PS07` | REPROTRACE: Pipeline Observability and Reproducibility Tool | See `PS07.md` |
+| `PS08` | AGENTGATE: Security Gateway for AI Actions and Information-Flow Control | See `PS08.md` |
+| `PS09` | FORGETGRAPH: Dependency-Aware Deletion Orchestrator for ML Pipelines | See `PS09.md` |
+| `PS10` | Open Innovation: Hardware / Embedded Systems / IoT Solution | See `PS10.md` |
 
 Replace the placeholder titles and specification links above with the official details in the problem folders. The authoritative statement inside the selected folder defines the challenge requirements.
 
