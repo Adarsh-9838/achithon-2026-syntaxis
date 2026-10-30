@@ -170,3 +170,22 @@ branch=ps09-forgetgraph
 repo_root=C:\PROJECTS\Syntaxis\achithon-2026-syntaxis
 worktree=main
 parent_agent=none
+## [2026-10-30T14:06:27.329+05:30] Explaining frontend and backend
+
+User Prompt (verbatim, secrets redacted):
+how to check the whole project where is the  frontend and backend one
+
+Agent Response Summary:
+Explained that the project uses Streamlit as its frontend and the Python package as its backend, with no separate frontend/backend servers. Provided the startup, test, and manual end-to-end verification steps and the main project file locations.
+
+Actions:
+* Appended this user-turn entry to the root log.txt.
+* Committed the required append-only logging update.
+
+Context:
+tool=GitHub Copilot
+problem_id=PS09
+branch=ps09-forgetgraph
+repo_root=C:\PROJECTS\Syntaxis\achithon-2026-syntaxis
+worktree=main
+parent_agent=none
