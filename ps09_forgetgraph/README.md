@@ -37,6 +37,14 @@ Unknown IDs are rejected without creating a tombstone or workflow. Select the
 failure-injection checkbox and a workflow step to simulate a crash, then use
 **Resume workflow** to continue.
 
+The dashboard has four sections: **Overview** (live artifact graph and
+pipeline counts), **Deletion workflow** (impact preview, deletion request,
+step progress, and before/after counts), **Verification & security**
+(independent-model evidence and an explicit implemented-controls / production
+gaps matrix), and **Audit trail** (persisted operational events). Security
+notes describe prototype safeguards without presenting the demo as production
+security certification.
+
 Run the test suite:
 
 ```powershell

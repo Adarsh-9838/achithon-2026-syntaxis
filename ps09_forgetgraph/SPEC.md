@@ -20,6 +20,10 @@ artifacts, feature/source consistency, and replacement-model agreement with
 an independently implemented reference fit. It also checks that the new model
 differs from the saved old model.
 
+The dashboard presents an overview and lineage graph, an impact preview and
+deletion workspace, independent verification evidence, a security-controls
+matrix that explicitly identifies production gaps, and an audit-event view.
+
 ## Data model
 
 - `source_records`: SHA-256 user key and synthetic numeric/categorical fields.
