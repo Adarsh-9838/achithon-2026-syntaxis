@@ -325,3 +325,30 @@ branch=ps09-forgetgraph
 repo_root=C:\PROJECTS\Syntaxis\achithon-2026-syntaxis
 worktree=main
 parent_agent=none
+## [2026-10-30T14:26:14.611+05:30] Helping locate SQLite database
+
+User Prompt (verbatim, secrets redacted):
+PS C:\Windows\System32> Rename-Item .\data\forgetgraph.sqlite .\data\forgetgraph-demo-backup.sqlite
+Rename-Item : Cannot rename because item at '.\data\forgetgraph.sqlite' does not exist.
+At line:1 char:1
++ Rename-Item .\data\forgetgraph.sqlite .\data\forgetgraph-demo-backup.sqlite
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [Rename-Item], PSInvalidOperationException
+    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.RenameItemCommand
+
+it is showing thiss
+
+Agent Response Summary:
+Explained that the command was run from C:\Windows\System32, so the relative .\data path pointed to the wrong directory. Provided an absolute, project-scoped PowerShell command to stop Streamlit, back up only the exact existing demo database if present, and restart the app using the project-specific venv.
+
+Actions:
+* Appended this user-turn entry to the root log.txt.
+* Committed the append-only logging update.
+
+Context:
+tool=GitHub Copilot
+problem_id=PS09
+branch=ps09-forgetgraph
+repo_root=C:\PROJECTS\Syntaxis\achithon-2026-syntaxis
+worktree=main
+parent_agent=none
