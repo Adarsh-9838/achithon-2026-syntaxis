@@ -1,0 +1,6 @@
+{
+  "alpha": 1.0,
+  "random_seed": 42,
+  "rtol": 1e-8,
+  "atol": 1e-10
+}
