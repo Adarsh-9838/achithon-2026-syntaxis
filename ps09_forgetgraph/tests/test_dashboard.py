@@ -14,6 +14,7 @@ def test_dashboard_sections_render_without_exceptions():
         "Overview",
         "Deletion workflow",
         "Verification",
+        "Evidence Certificates",
         "Audit trail",
     ]
 

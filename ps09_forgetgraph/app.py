@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -288,6 +289,9 @@ orchestrator = get_orchestrator()
 graph = orchestrator.get_artifact_graph()
 counts = orchestrator.get_database_counts()
 workflow_rows = orchestrator.list_workflows(limit=max(counts["workflows"], 1))
+certificate_rows = orchestrator.list_certificates(
+    limit=max(counts["workflows"], 1)
+)
 active_model_count = next(
     (node["count"] for node in graph["nodes"] if node["id"] == "ridge_model"), 0
 )
@@ -314,8 +318,14 @@ st.caption(
 )
 st.write("")
 
-overview_tab, deletion_tab, verification_tab, audit_tab = st.tabs(
-    ["Overview", "Deletion workflow", "Verification", "Audit trail"]
+overview_tab, deletion_tab, verification_tab, certificate_tab, audit_tab = st.tabs(
+    [
+        "Overview",
+        "Deletion workflow",
+        "Verification",
+        "Evidence Certificates",
+        "Audit trail",
+    ]
 )
 
 with overview_tab:
@@ -633,6 +643,20 @@ with deletion_tab:
                     "The cache is not automatically refilled."
                 )
             )
+    else:
+        section_heading(
+            "Deletion stages",
+            "Each accepted request records the outcome and timestamps for these ordered operations.",
+        )
+        stage_columns = st.columns(4)
+        for column, (_, title, explanation) in zip(stage_columns, WORKFLOW_STAGES):
+            with column:
+                with st.container(border=True):
+                    st.markdown(f"**{title}**")
+                    st.caption(explanation)
+        st.caption(
+            "The cache stage may find it already empty; until a request runs, these operations are not included in recorded workflow evidence."
+        )
 
 with verification_tab:
     section_heading(
@@ -869,6 +893,105 @@ with verification_tab:
             "Verification attempts and technical events are recorded in the Audit trail."
         )
 
+with certificate_tab:
+    section_heading(
+        "Deletion evidence certificates",
+        "One certificate identity per accepted request. Updates preserve earlier integrity-sealed evidence snapshots in its history.",
+    )
+    if not certificate_rows:
+        st.info("Accepted deletion requests will appear here with their evidence.")
+    else:
+        certificate_ids = [row["deletion_id"] for row in certificate_rows]
+        selected_certificate_id = st.selectbox(
+            "Deletion request",
+            certificate_ids,
+            key="certificate_request",
+            format_func=lambda value: next(
+                (
+                    f"{row['certificate_id'][:8]} · {row['status']} · "
+                    f"request {value[:8]}"
+                    for row in certificate_rows
+                    if row["deletion_id"] == value
+                ),
+                value,
+            ),
+        )
+        certificate = orchestrator.get_certificate(selected_certificate_id)
+        document = certificate["document"]
+        if not certificate["integrity_valid"]:
+            st.error(
+                "Certificate integrity validation failed. Treat this certificate as FAILED."
+            )
+        elif certificate["status"] == "VERIFIED":
+            st.success("VERIFIED · execution and independent verification evidence are complete.")
+        elif certificate["status"] == "FAILED":
+            st.error("FAILED · recorded execution or independent verification did not pass.")
+        else:
+            st.warning("INCOMPLETE · required execution or independent verification evidence is missing.")
+
+        request = document["request"]
+        st.write(
+            f"**Certificate ID:** `{certificate['certificate_id']}`  \n"
+            f"**Request ID:** `{request['request_id']}`  \n"
+            f"**Requested at:** {request['requested_at']}  \n"
+            f"**Affected artifact IDs:** {', '.join(request['affected_artifact_ids']) or 'none recorded'}"
+        )
+        st.caption(
+            "Deleted source record IDs are one-way SHA-256 user-ID hashes; raw identifiers are not included."
+        )
+        st.json(request["deleted_source_record_ids"])
+
+        execution_column, verification_column = st.columns(2)
+        with execution_column:
+            st.markdown("#### Execution evidence")
+            st.caption(
+                f"Execution status: {document['execution_evidence']['status']}"
+            )
+            st.json(document["execution_evidence"])
+        with verification_column:
+            st.markdown("#### Independent verification evidence")
+            st.caption(
+                f"Verification status: {document['verification_evidence']['status']}"
+            )
+            st.json(document["verification_evidence"])
+
+        st.code(certificate["integrity_hash"], language=None)
+        st.caption(
+            f"SHA-256 integrity valid: {'yes' if certificate['integrity_valid'] else 'no'} · "
+            f"Certificate revision {certificate['version']} · created {certificate['created_at']}"
+        )
+        st.download_button(
+            "Download certificate JSON",
+            data=json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False),
+            file_name=f"deletion-certificate-{certificate['certificate_id']}.json",
+            mime="application/json",
+            key=f"download-certificate-{selected_certificate_id}",
+        )
+
+        history = orchestrator.get_certificate_history(selected_certificate_id)
+        st.markdown("#### Certificate history")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Revision": revision["version"],
+                        "Status": revision["status"],
+                        "Recorded at": revision["recorded_at"],
+                        "Reason": revision["reason"],
+                        "Integrity valid": revision["integrity_valid"],
+                    }
+                    for revision in history
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(
+            "Earlier FAILED or INCOMPLETE revisions remain in history when a retry records new evidence; retries never create another certificate ID for the request."
+        )
+        st.warning(document["integrity_scope"])
+
+with verification_tab:
     with st.expander("Security and prototype limits"):
         section_heading(
             "Security and privacy controls",

@@ -64,6 +64,10 @@ The database `data/forgetgraph.sqlite` is initialized from the committed
 6. To demonstrate execution recovery, use **Deletion workflow** and enable
    failure injection. Resume the resulting interrupted workflow; already
    completed steps are not repeated.
+7. Open **Evidence Certificates** to select a request, review execution and
+   independent verification evidence separately, download its JSON certificate,
+   and inspect revisions. Failed and incomplete snapshots remain in history
+   after a retry; the request retains one stable certificate ID.
 
 The app also supports a typed deletion request and a lineage impact preview.
 Unknown IDs are rejected without creating a workflow or tombstone. Repeating a
@@ -94,6 +98,19 @@ database.
 - Execution (`PENDING`, `RUNNING`, `COMPLETED`, `FAILED`) and verification
   (`NOT_RUN`, `RUNNING`, `PASSED`, `FAILED`) are separate persisted statuses.
   Verification attempts and their audit events are retained independently.
+- Each accepted request has one stable deletion-certificate ID. Its JSON
+  records the request time, hashed source-record ID, lineage-derived affected
+  artifact IDs, per-stage outcomes/counts/timestamps, and distinct execution
+  and independent-verification evidence. Verification includes content-derived
+  replacement/reference model IDs, coefficient/intercept comparisons, maximum
+  and mean absolute prediction deltas, exact configured tolerances, and
+  attempt outcomes.
+- Certificates use SHA-256 over canonical UTF-8 JSON (sorted keys, compact
+  separators, excluding the `integrity` object). Prior failed or incomplete
+  certificate snapshots are retained in request history as retries update the
+  same certificate. This hash detects document changes when the expected hash
+  is trusted; it is not a digital signature or proof of permanent or universal
+  erasure.
 
 ## Database reset behavior
 
@@ -114,7 +131,10 @@ verification failures; independent statuses; verification exceptions,
 retries, interrupted attempts, and audit events; repeated-request no-op;
 tombstone ingestion prevention; database reinitialization semantics; ordinary
 failures at every execution stage; and crash/resume without duplicate effects.
-Streamlit AppTest renders every dashboard section.
+Certificate tests cover successful, failed, incomplete, and tampered JSON
+certificates, deterministic integrity validation, retained retry history, and
+idempotent certificate identity. Streamlit AppTest renders every dashboard
+section, including Evidence Certificates.
 
 ## Limitations
 

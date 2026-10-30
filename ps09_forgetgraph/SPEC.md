@@ -22,7 +22,7 @@ differences are reported as evidence, but are not a required pass condition.
 
 The dashboard presents an overview and lineage graph, an impact preview and
 deletion workspace, independent verification evidence, a security-controls
-matrix that explicitly identifies production gaps, and an audit-event view.
+matrix that explicitly identifies production gaps, an evidence-certificate area, and an audit-event view.
 
 ## Data model
 
@@ -39,10 +39,15 @@ matrix that explicitly identifies production gaps, and an audit-event view.
 - `tombstones`: durable SHA-256 identifiers of deletion requests.
 - `deletion_workflows`, `workflow_steps`: execution state, separate
   verification state, affected artifact snapshot, old-model snapshot, ordered
-  idempotent operations, and effect counts.
+  idempotent operations, effect counts, and per-stage start/outcome times.
 - `verification_attempts`: a durable record for each verification run,
   including start/completion time, result or exception, and attempt number.
 - `audit_events`: append-only operational events with timestamps and details.
+- `deletion_certificates`: one stable certificate identity and latest
+  integrity-sealed JSON snapshot per accepted deletion request.
+- `deletion_certificate_history`: immutable prior certificate snapshots,
+  including failed and incomplete results, retained when a retry records new
+  evidence.
 
 SQLite transactions make each data mutation and its step-completion update
 atomic. A process restart can resume any non-completed operation. Each handler
@@ -89,6 +94,36 @@ from a hard-coded affected-artifact list.
 6. Managed ingestion checks tombstones and refuses a deleted identifier
    before any database write.
 
+## Deletion evidence certificates
+
+Each accepted request receives one stable certificate ID and a structured
+JSON certificate, initially marked `INCOMPLETE`. The certificate is refreshed
+from the persisted workflow, step, verification-attempt, and audit records as
+real outcomes become available. Every prior certificate snapshot is retained
+in `deletion_certificate_history`; retries update the same request's current
+certificate rather than creating duplicate certificate identities or
+discarding earlier failures.
+
+The JSON contains the request ID and time, SHA-256 source-record identifier,
+lineage-derived affected artifact IDs, tombstone time, execution status and
+per-stage outcomes/effect counts/start and completion timestamps, and a
+separate verification section. Independent verification includes replacement
+and reference model fingerprints, coefficient/intercept comparisons, maximum
+and mean absolute prediction deltas, the exact configured `rtol`/`atol`, each
+attempt's timestamps/status/report/error, and its final outcome. Missing
+evidence or a running workflow remains `INCOMPLETE`; failed execution,
+verification, or integrity validation is `FAILED`; only complete passing
+execution and independent verification evidence is `VERIFIED`.
+
+The integrity digest is SHA-256 over the UTF-8 bytes of canonical JSON with
+sorted keys, compact separators, and the complete `integrity` object omitted.
+The exported JSON includes the algorithm and canonicalization rule so a
+consumer can recompute the digest. This detects accidental or deliberate
+document changes when the expected digest is trusted; it is not a digital
+signature and does not prove permanent or universal erasure. Dashboard
+history shows retained certificate revisions, distinct execution and
+verification evidence, integrity status, and a JSON download.
+
 ## Features, model, and verification
 
 The committed CSV contains 700 seeded synthetic users in four regions.
@@ -103,8 +138,9 @@ fits its own scaler and Ridge model on the same retained features, alpha, and
 seed. Verification compares replacement and reference coefficients,
 intercept, and predictions with `rtol=1e-8` and `atol=1e-10`. It reports each
 comparison, the configured tolerances, maximum absolute coefficient,
-intercept, and prediction differences, and whether the replacement differs
-from the previous model. The old-model difference is evidence only. It also
+intercept, and prediction differences, mean absolute prediction difference,
+content-derived replacement/reference model IDs, and whether the replacement
+differs from the previous model. The old-model difference is evidence only. It also
 fails on a missing tombstone, deleted-ID reappearance, or inconsistent
 source/feature membership.
 
@@ -150,4 +186,6 @@ equal; status independence; repeated-request no-op behavior; ingestion
 rejection; ordinary failure and resume at every workflow step; crash/restart
 idempotency; and database reinitialization from the source CSV. Dashboard
 sections, including the guided demo and retry control, are checked separately
-from the unit suite.
+from the unit suite. Certificate tests cover successful, failed, incomplete,
+and tampered evidence, canonical hash validation, retry history preservation,
+and one stable certificate identity per deletion request.
