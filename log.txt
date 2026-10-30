@@ -391,3 +391,42 @@ branch=ps09-forgetgraph
 repo_root=C:\PROJECTS\Syntaxis\achithon-2026-syntaxis
 worktree=main
 parent_agent=none
+## [2026-10-30T14:33:48.356+05:30] Explaining deletion evidence values
+
+User Prompt (verbatim, secrets redacted):
+### Before / after evidence[](http://localhost:8501/#before-after-evidence)
+
+Source records
+
+699
+
+-1
+
+Feature rows
+
+699
+
+-1
+
+Cached predictions
+
+0
+
+-700
+
+Cache invalidation removed **700** prediction(s). Tolerance: rtol=1.0e-08, atol=1.0e-10. what is this and it is updated
+
+Agent Response Summary:
+Explained that the displayed values are current post-deletion counts with deltas relative to before the selected workflow: source and feature rows each decreased by one, and all 700 cached predictions were invalidated. Clarified that the tolerances configure numerical comparisons of the replacement model against an independently retrained reference, and confirmed these results are expected.
+
+Actions:
+* Appended this user-turn entry to the root log.txt.
+* Committed the append-only logging update.
+
+Context:
+tool=GitHub Copilot
+problem_id=PS09
+branch=ps09-forgetgraph
+repo_root=C:\PROJECTS\Syntaxis\achithon-2026-syntaxis
+worktree=main
+parent_agent=none
