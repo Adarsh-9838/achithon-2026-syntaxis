@@ -4,7 +4,8 @@ A local, deterministic prototype for dependency-aware deletion in a synthetic
 Ridge-regression pipeline. It records source, engineered-feature, prediction
 cache, and model lineage in SQLite; persists execution steps and independent
 verification attempts; blocks managed re-ingestion of tombstoned IDs; and
-provides a guided Streamlit demonstration.
+provides a Streamlit demonstration with hash-validated Deletion Evidence
+Certificates.
 
 ## Setup
 
@@ -70,6 +71,70 @@ Unknown IDs are rejected without creating a workflow or tombstone. Repeating a
 request for a tombstoned ID returns `already deleted` without changing the
 database.
 
+On a fresh dashboard visit, the deletion workflow and verification views start
+in **Waiting / Not checked yet** rather than selecting an older result. Previous
+requests remain saved and can be reviewed explicitly under **Saved deletion
+history**. Each saved-history option and its detail view identify the deleted
+synthetic user ID as well as execution and verification statuses. The ID is
+resolved against the committed synthetic seed CSV; for IDs outside that
+dataset, the app displays an unavailable-ID note and a short hash reference
+instead of storing or exposing a raw ID in the certificate. Submitting a
+previously deleted ID displays a notification and does not create another
+workflow or change database contents.
+
+## Deletion Evidence Certificates
+
+Open **Evidence Certificates** to select a deletion request and certificate
+revision. The view separates persisted execution stages from independent
+verification evidence, labels the certificate **VERIFIED**, **FAILED**, or
+**INCOMPLETE**, and provides both a branded receipt-style image and the
+machine-readable JSON certificate. The receipt always displays FORGETGRAPH at
+the top. Download the image as SVG to print or share it, or expand **View
+receipt image** for an inline, scrollable preview; the preview is collapsed by
+default to keep the page compact. Download JSON when you need the complete
+structured evidence. The SHA-256 integrity check
+validates that the stored certificate payload matches its recorded hash.
+
+Certificates are generated and revised from the existing workflow steps,
+verification report, and audit-backed timestamps. A request has one stable
+certificate ID; repeated requests for a tombstoned user return the existing
+certificate reference and do not create a duplicate. Old databases are
+upgraded with certificate tables and historical certificate snapshots. If an
+older workflow lacks required timestamps or verification evidence, its
+certificate is marked **INCOMPLETE**, not retroactively called verified.
+
+The certificate's deleted-record identifier is a SHA-256 pseudonymous hash,
+not the raw synthetic ID. Hash validation detects accidental or direct
+payload changes relative to the stored digest, but it is not a digital
+signature and does **not** independently prove permanent erasure from every
+copy, backup, or external system.
+
+### Certificate demonstration
+
+1. In **Deletion workflow**, enter an active synthetic ID and select **Run
+   deletion**. The orchestrator records the request, stage results, timestamps,
+   and model generation while running the existing workflow.
+2. Open **Evidence Certificates** and select that request. A complete,
+   successfully independently verified request is **VERIFIED**. An execution
+   or comparison failure is **FAILED**; missing evidence is **INCOMPLETE**.
+3. Review the separate execution and verification evidence. Select **Download
+   receipt image (SVG)** to save the FORGETGRAPH-branded receipt, or expand
+   **View receipt image** for a scrollable inline preview. Select **Download
+   certificate JSON** for the complete machine-readable certificate.
+4. The SHA-256 integrity check validates the selected current or historical
+   certificate revision against its stored hash.
+5. To test failure, tampering, retry, and incomplete-state behavior without
+   changing the app database, run:
+
+   ```powershell
+   .\.venv\Scripts\python.exe -m pytest -v tests\test_orchestrator.py
+   ```
+
+Older workflows are migrated from saved execution and verification records.
+When they lack stage timestamps or complete verification metrics, their
+certificates remain **INCOMPLETE** rather than receiving a retroactive
+verified claim.
+
 ## Design and verification
 
 - The artifact graph and versioned user-to-artifact lineage are persisted in
@@ -91,6 +156,17 @@ database.
   tolerances. It reports old-to-replacement differences as evidence; a model
   does **not** have to differ from the old model to pass independent-reference
   verification.
+- Each accepted request receives a UUID certificate. SQLite stores its
+  canonical JSON, SHA-256 integrity hash, current status, and append-only
+  revisions. Verification measurements are reused from the existing
+  verification attempt report; certificate history is linked to the workflow
+  instead of duplicating execution or verification records.
+- `VERIFIED` requires completed execution, passing independent verification,
+  and complete stage/verification evidence. Failed execution or comparisons
+  cannot produce that status; missing evidence remains `INCOMPLETE`.
+- Certificate verification evidence includes model identifiers, individual
+  coefficient/intercept/prediction comparison results, configured
+  tolerances, and maximum and mean absolute prediction differences.
 - Execution (`PENDING`, `RUNNING`, `COMPLETED`, `FAILED`) and verification
   (`NOT_RUN`, `RUNNING`, `PASSED`, `FAILED`) are separate persisted statuses.
   Verification attempts and their audit events are retained independently.
@@ -114,7 +190,11 @@ verification failures; independent statuses; verification exceptions,
 retries, interrupted attempts, and audit events; repeated-request no-op;
 tombstone ingestion prevention; database reinitialization semantics; ordinary
 failures at every execution stage; and crash/resume without duplicate effects.
-Streamlit AppTest renders every dashboard section.
+Certificate tests cover successful JSON generation, execution failure,
+verification failure and retry, incomplete evidence, duplicate-request
+idempotency, historical model IDs, revision retention, and tamper detection.
+Streamlit AppTest renders every dashboard section, including the certificate
+viewer and download control.
 
 ## Limitations
 

@@ -79,6 +79,7 @@ class ForgetGraphOrchestrator:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._create_schema()
         self._seed_if_needed()
+        self._backfill_deletion_certificates()
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -97,6 +98,20 @@ class ForgetGraphOrchestrator:
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _canonical_json(value: dict) -> str:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+
+    @classmethod
+    def _evidence_hash(cls, value: dict) -> str:
+        return hashlib.sha256(cls._canonical_json(value).encode("utf-8")).hexdigest()
 
     @staticmethod
     def hash_user_id(user_id: str) -> str:
@@ -185,6 +200,9 @@ class ForgetGraphOrchestrator:
                 deletion_id TEXT PRIMARY KEY,
                 user_hash TEXT NOT NULL,
                 requested_at TEXT NOT NULL,
+                old_model_id TEXT,
+                replacement_model_id TEXT,
+                verification_config_json TEXT,
                 execution_status TEXT NOT NULL
                     CHECK (execution_status IN ('PENDING','RUNNING','COMPLETED','FAILED')),
                 verification_status TEXT NOT NULL
@@ -205,6 +223,8 @@ class ForgetGraphOrchestrator:
                 status TEXT NOT NULL
                     CHECK (status IN ('PENDING','RUNNING','COMPLETED','FAILED')),
                 effect_count INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                completed_at TEXT,
                 error_text TEXT,
                 PRIMARY KEY (deletion_id, step_name)
             )
@@ -239,11 +259,63 @@ class ForgetGraphOrchestrator:
                 UNIQUE (deletion_id, attempt_number)
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS deletion_certificates (
+                certificate_id TEXT PRIMARY KEY,
+                deletion_id TEXT NOT NULL UNIQUE
+                    REFERENCES deletion_workflows(deletion_id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                status TEXT NOT NULL
+                    CHECK (status IN ('INCOMPLETE','FAILED','VERIFIED')),
+                revision_number INTEGER NOT NULL,
+                certificate_json TEXT NOT NULL,
+                integrity_hash TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS deletion_certificate_revisions (
+                revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                certificate_id TEXT NOT NULL
+                    REFERENCES deletion_certificates(certificate_id),
+                revision_number INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL
+                    CHECK (status IN ('INCOMPLETE','FAILED','VERIFIED')),
+                certificate_json TEXT NOT NULL,
+                integrity_hash TEXT NOT NULL,
+                UNIQUE (certificate_id, revision_number)
+            )
+            """,
         )
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             for statement in statements:
                 connection.execute(statement)
+            workflow_step_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(workflow_steps)")
+            }
+            if "started_at" not in workflow_step_columns:
+                connection.execute("ALTER TABLE workflow_steps ADD COLUMN started_at TEXT")
+            if "completed_at" not in workflow_step_columns:
+                connection.execute("ALTER TABLE workflow_steps ADD COLUMN completed_at TEXT")
+            workflow_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(deletion_workflows)")
+            }
+            if "old_model_id" not in workflow_columns:
+                connection.execute(
+                    "ALTER TABLE deletion_workflows ADD COLUMN old_model_id TEXT"
+                )
+            if "verification_config_json" not in workflow_columns:
+                connection.execute(
+                    "ALTER TABLE deletion_workflows ADD COLUMN verification_config_json TEXT"
+                )
+            if "replacement_model_id" not in workflow_columns:
+                connection.execute(
+                    "ALTER TABLE deletion_workflows ADD COLUMN replacement_model_id TEXT"
+                )
             for artifact_id, label, count_table, operation, order in self.ARTIFACTS:
                 connection.execute(
                     """
@@ -456,7 +528,7 @@ class ForgetGraphOrchestrator:
     def _rebuild_cache(self, connection: sqlite3.Connection) -> int:
         features, _, user_hashes = self._active_features(connection)
         model_row = connection.execute(
-            "SELECT model_json FROM models WHERE model_id = 'active'"
+            "SELECT model_json, generation FROM models WHERE model_id = 'active'"
         ).fetchone()
         if model_row is None:
             raise RuntimeError("Cannot populate predictions without an active model")
@@ -541,6 +613,262 @@ class ForgetGraphOrchestrator:
                 ],
             }
 
+    def _refresh_deletion_certificate(
+        self, connection: sqlite3.Connection, deletion_id: str
+    ) -> dict:
+        workflow = connection.execute(
+            "SELECT * FROM deletion_workflows WHERE deletion_id = ?",
+            (deletion_id,),
+        ).fetchone()
+        if workflow is None:
+            raise KeyError(f"Unknown deletion workflow: {deletion_id}")
+        steps = connection.execute(
+            """
+            SELECT step_name, artifact_id, step_order, status, effect_count,
+                   started_at, completed_at, error_text
+            FROM workflow_steps
+            WHERE deletion_id = ?
+            ORDER BY step_order, artifact_id
+            """,
+            (deletion_id,),
+        ).fetchall()
+        certificate_row = connection.execute(
+            "SELECT * FROM deletion_certificates WHERE deletion_id = ?",
+            (deletion_id,),
+        ).fetchone()
+        report = (
+            json.loads(workflow["verification_report_json"])
+            if workflow["verification_report_json"]
+            else None
+        )
+        execution_evidence_complete = bool(steps) and all(
+            step["status"] == "COMPLETED"
+            and step["started_at"]
+            and step["completed_at"]
+            for step in steps
+        )
+        verification_evidence_complete = bool(
+            report
+            and report.get("reference_model_id")
+            and report.get("replacement_model_id")
+            and report.get("mean_reference_prediction_abs_diff") is not None
+        )
+        if workflow["execution_status"] == "FAILED":
+            status = "FAILED"
+        elif (
+            workflow["execution_status"] == "COMPLETED"
+            and workflow["verification_status"] == "FAILED"
+            and report is not None
+        ):
+            status = "FAILED"
+        elif (
+            workflow["execution_status"] == "COMPLETED"
+            and workflow["verification_status"] == "PASSED"
+            and report is not None
+            and report.get("passed") is True
+            and execution_evidence_complete
+            and verification_evidence_complete
+        ):
+            status = "VERIFIED"
+        else:
+            status = "INCOMPLETE"
+
+        verification_evidence = None
+        if report is not None:
+            verification_evidence = {
+                "status": workflow["verification_status"],
+                "result": "PASS" if report.get("passed") else "FAIL",
+                "reference_model_id": report.get("reference_model_id"),
+                "replacement_model_id": report.get("replacement_model_id"),
+                "coefficient_comparison": {
+                    "passed": report.get("coefficients_match"),
+                    "max_absolute_difference": report.get(
+                        "max_reference_coefficient_abs_diff"
+                    ),
+                },
+                "intercept_comparison": {
+                    "passed": report.get("intercept_match"),
+                    "absolute_difference": report.get(
+                        "reference_intercept_abs_diff"
+                    ),
+                },
+                "prediction_comparison": {
+                    "passed": report.get("predictions_match"),
+                    "max_absolute_difference": report.get(
+                        "max_reference_prediction_abs_diff"
+                    ),
+                    "mean_absolute_difference": report.get(
+                        "mean_reference_prediction_abs_diff"
+                    ),
+                },
+                "tolerances": {
+                    "rtol": report.get("rtol"),
+                    "atol": report.get("atol"),
+                },
+                "failure_reasons": report.get("failure_reasons", []),
+                "attempt_number": report.get("attempt_number"),
+            }
+            verification_evidence["evidence_hash"] = self._evidence_hash(
+                verification_evidence
+            )
+
+        created_at = (
+            certificate_row["created_at"]
+            if certificate_row is not None
+            else self._now()
+        )
+        prior_updated_at = (
+            certificate_row["updated_at"]
+            if certificate_row is not None
+            else created_at
+        )
+        certificate_id = (
+            certificate_row["certificate_id"]
+            if certificate_row is not None
+            else str(uuid.uuid4())
+        )
+        payload = {
+            "schema_version": 1,
+            "certificate_id": certificate_id,
+            "request_id": deletion_id,
+            "created_at": created_at,
+            "updated_at": prior_updated_at,
+            "status": status,
+            "deleted_record_ids": [workflow["user_hash"]],
+            "affected_artifacts": json.loads(
+                workflow["affected_artifacts_json"]
+            ),
+            "execution": {
+                "status": workflow["execution_status"],
+                "stages": [
+                    {
+                        "stage": step["step_name"],
+                        "artifact_id": step["artifact_id"],
+                        "status": step["status"],
+                        "effect_count": step["effect_count"],
+                        "result": (
+                            True
+                            if step["status"] == "COMPLETED"
+                            else False
+                            if step["status"] == "FAILED"
+                            else None
+                        ),
+                        "started_at": step["started_at"],
+                        "completed_at": step["completed_at"],
+                        "error": step["error_text"],
+                    }
+                    for step in steps
+                ],
+                "requested_at": workflow["requested_at"],
+                "error": workflow["error_text"],
+                "old_model_id": workflow["old_model_id"],
+                "replacement_model_id": workflow["replacement_model_id"],
+            },
+            "verification": verification_evidence
+            or {
+                "status": workflow["verification_status"],
+                "result": None,
+                "evidence_hash": None,
+            },
+        }
+        payload["integrity_hash"] = self._evidence_hash(payload)
+        certificate_json = self._canonical_json(payload)
+        existing_json = (
+            certificate_row["certificate_json"]
+            if certificate_row is not None
+            else None
+        )
+        if existing_json == certificate_json:
+            return payload
+        if certificate_row is not None:
+            payload["updated_at"] = self._now()
+            payload["integrity_hash"] = self._evidence_hash(
+                {key: value for key, value in payload.items() if key != "integrity_hash"}
+            )
+            certificate_json = self._canonical_json(payload)
+
+        revision_number = (
+            certificate_row["revision_number"] + 1
+            if certificate_row is not None
+            else 1
+        )
+        updated_at = payload["updated_at"]
+        if certificate_row is None:
+            connection.execute(
+                """
+                INSERT INTO deletion_certificates
+                (certificate_id, deletion_id, created_at, updated_at, status,
+                 revision_number, certificate_json, integrity_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    certificate_id,
+                    deletion_id,
+                    created_at,
+                    updated_at,
+                    status,
+                    revision_number,
+                    certificate_json,
+                    payload["integrity_hash"],
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE deletion_certificates
+                SET updated_at = ?, status = ?, revision_number = ?,
+                    certificate_json = ?, integrity_hash = ?
+                WHERE deletion_id = ?
+                """,
+                (
+                    updated_at,
+                    status,
+                    revision_number,
+                    certificate_json,
+                    payload["integrity_hash"],
+                    deletion_id,
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO deletion_certificate_revisions
+            (certificate_id, revision_number, created_at, status,
+             certificate_json, integrity_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                certificate_id,
+                revision_number,
+                updated_at,
+                status,
+                certificate_json,
+                payload["integrity_hash"],
+            ),
+        )
+        self._record_audit(
+            connection,
+            "deletion_certificate_updated",
+            json.dumps(
+                {
+                    "certificate_id": certificate_id,
+                    "revision_number": revision_number,
+                    "status": status,
+                    "integrity_hash": payload["integrity_hash"],
+                },
+                sort_keys=True,
+            ),
+            deletion_id,
+        )
+        return payload
+
+    def _backfill_deletion_certificates(self) -> None:
+        with self._connection() as connection:
+            workflows = connection.execute(
+                "SELECT deletion_id FROM deletion_workflows ORDER BY requested_at"
+            ).fetchall()
+            for workflow in workflows:
+                self._refresh_deletion_certificate(connection, workflow["deletion_id"])
+
     def _create_workflow(self, user_hash: str) -> tuple[str, bool]:
         deletion_id = str(uuid.uuid4())
         with self._connection() as connection:
@@ -572,23 +900,37 @@ class ForgetGraphOrchestrator:
                 ).fetchall()
             ]
             old_model_row = connection.execute(
-                "SELECT model_json FROM models WHERE model_id = 'active'"
+                "SELECT model_json, generation FROM models WHERE model_id = 'active'"
             ).fetchone()
             old_model = old_model_row["model_json"] if old_model_row else None
+            old_model_id = (
+                f"active:{old_model_row['generation']}" if old_model_row else None
+            )
             counts_before = self._count_records(connection)
             now = self._now()
             connection.execute(
                 """
                 INSERT INTO deletion_workflows (
-                    deletion_id, user_hash, requested_at, execution_status,
+                    deletion_id, user_hash, requested_at, old_model_id,
+                    verification_config_json, execution_status,
                     verification_status, affected_artifacts_json,
                     counts_before_json, old_model_json
-                ) VALUES (?, ?, ?, 'PENDING', 'NOT_RUN', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 'PENDING', 'NOT_RUN', ?, ?, ?)
                 """,
                 (
                     deletion_id,
                     user_hash,
                     now,
+                    old_model_id,
+                    json.dumps(
+                        {
+                            "alpha": self.config.alpha,
+                            "random_seed": self.config.random_seed,
+                            "rtol": self.config.rtol,
+                            "atol": self.config.atol,
+                        },
+                        sort_keys=True,
+                    ),
                     json.dumps(affected),
                     json.dumps(counts_before, sort_keys=True),
                     old_model,
@@ -626,6 +968,7 @@ class ForgetGraphOrchestrator:
                             operation["operation_order"],
                         ),
                     )
+            self._refresh_deletion_certificate(connection, deletion_id)
             self._record_audit(
                 connection,
                 "deletion_requested",
@@ -646,9 +989,11 @@ class ForgetGraphOrchestrator:
         with self._connection() as connection:
             existing = connection.execute(
                 """
-                SELECT t.deletion_id, w.execution_status, w.verification_status
+                SELECT t.deletion_id, w.execution_status, w.verification_status,
+                       c.certificate_id
                 FROM tombstones AS t
                 JOIN deletion_workflows AS w USING (deletion_id)
+                LEFT JOIN deletion_certificates AS c USING (deletion_id)
                 WHERE t.user_hash = ?
                 """,
                 (user_hash,),
@@ -659,6 +1004,7 @@ class ForgetGraphOrchestrator:
                 "deletion_id": existing["deletion_id"],
                 "execution_status": existing["execution_status"],
                 "verification_status": existing["verification_status"],
+                "certificate_id": existing["certificate_id"],
             }
         deletion_id, already_deleted = self._create_workflow(user_hash)
         if already_deleted:
@@ -666,6 +1012,9 @@ class ForgetGraphOrchestrator:
                 "already_deleted": True,
                 "deletion_id": deletion_id,
                 **self._workflow_statuses(deletion_id),
+                "certificate_id": self.get_deletion_certificate(deletion_id)[
+                    "certificate_id"
+                ],
             }
         return self._execute_workflow(deletion_id, fail_after_step)
 
@@ -714,6 +1063,9 @@ class ForgetGraphOrchestrator:
                     "already_deleted": False,
                     "deletion_id": deletion_id,
                     **self._workflow_statuses(deletion_id),
+                    "certificate_id": self.get_deletion_certificate(deletion_id)[
+                        "certificate_id"
+                    ],
                 }
             connection.execute(
                 """
@@ -723,6 +1075,7 @@ class ForgetGraphOrchestrator:
                 """,
                 (deletion_id,),
             )
+            self._refresh_deletion_certificate(connection, deletion_id)
 
         with self._connection() as connection:
             steps = connection.execute(
@@ -742,11 +1095,13 @@ class ForgetGraphOrchestrator:
                 connection.execute(
                     """
                     UPDATE workflow_steps
-                    SET status = 'RUNNING', error_text = NULL
+                    SET status = 'RUNNING', started_at = COALESCE(started_at, ?),
+                        error_text = NULL
                     WHERE deletion_id = ? AND step_name = ?
                     """,
-                    (deletion_id, step_name),
+                    (self._now(), deletion_id, step_name),
                 )
+                self._refresh_deletion_certificate(connection, deletion_id)
             try:
                 with self._connection() as connection:
                     workflow = connection.execute(
@@ -756,13 +1111,26 @@ class ForgetGraphOrchestrator:
                     effect_count = self._apply_step(
                         connection, step_name, workflow["user_hash"]
                     )
+                    if step_name == "replace_model":
+                        model_generation = connection.execute(
+                            "SELECT generation FROM models WHERE model_id = 'active'"
+                        ).fetchone()["generation"]
+                        connection.execute(
+                            """
+                            UPDATE deletion_workflows
+                            SET replacement_model_id = ?
+                            WHERE deletion_id = ?
+                            """,
+                            (f"active:{model_generation}", deletion_id),
+                        )
                     connection.execute(
                         """
                         UPDATE workflow_steps
-                        SET status = 'COMPLETED', effect_count = ?, error_text = NULL
+                        SET status = 'COMPLETED', effect_count = ?, completed_at = ?,
+                            error_text = NULL
                         WHERE deletion_id = ? AND step_name = ?
                         """,
-                        (effect_count, deletion_id, step_name),
+                        (effect_count, self._now(), deletion_id, step_name),
                     )
                     self._record_audit(
                         connection,
@@ -773,15 +1141,16 @@ class ForgetGraphOrchestrator:
                         ),
                         deletion_id,
                     )
+                    self._refresh_deletion_certificate(connection, deletion_id)
             except Exception as error:
                 with self._connection() as connection:
                     connection.execute(
                         """
                         UPDATE workflow_steps
-                        SET status = 'FAILED', error_text = ?
+                        SET status = 'FAILED', completed_at = ?, error_text = ?
                         WHERE deletion_id = ? AND step_name = ?
                         """,
-                        (str(error), deletion_id, step_name),
+                        (self._now(), str(error), deletion_id, step_name),
                     )
                     connection.execute(
                         """
@@ -797,6 +1166,7 @@ class ForgetGraphOrchestrator:
                         json.dumps({"step": step_name, "error": str(error)}),
                         deletion_id,
                     )
+                    self._refresh_deletion_certificate(connection, deletion_id)
                 raise
             if fail_after_step == step_name:
                 raise SimulatedCrash(deletion_id, step_name)
@@ -816,11 +1186,15 @@ class ForgetGraphOrchestrator:
                 "All recorded deletion operations completed",
                 deletion_id,
             )
+            self._refresh_deletion_certificate(connection, deletion_id)
         self.verify_deletion(deletion_id)
         return {
             "already_deleted": False,
             "deletion_id": deletion_id,
             **self._workflow_statuses(deletion_id),
+            "certificate_id": self.get_deletion_certificate(deletion_id)[
+                "certificate_id"
+            ],
         }
 
     def _apply_step(
@@ -926,6 +1300,7 @@ class ForgetGraphOrchestrator:
                 json.dumps({"attempt_number": attempt_number}, sort_keys=True),
                 deletion_id,
             )
+            self._refresh_deletion_certificate(connection, deletion_id)
 
         try:
             with self._connection() as connection:
@@ -933,6 +1308,16 @@ class ForgetGraphOrchestrator:
                     "SELECT * FROM deletion_workflows WHERE deletion_id = ?",
                     (deletion_id,),
                 ).fetchone()
+                verification_config = (
+                    json.loads(workflow["verification_config_json"])
+                    if workflow["verification_config_json"]
+                    else {
+                        "alpha": self.config.alpha,
+                        "random_seed": self.config.random_seed,
+                        "rtol": self.config.rtol,
+                        "atol": self.config.atol,
+                    }
+                )
                 user_hash = workflow["user_hash"]
                 source_hashes = {
                     row["user_hash"]
@@ -960,7 +1345,7 @@ class ForgetGraphOrchestrator:
                     is not None
                 )
                 model_row = connection.execute(
-                    "SELECT model_json FROM models WHERE model_id = 'active'"
+                    "SELECT model_json, generation FROM models WHERE model_id = 'active'"
                 ).fetchone()
                 if model_row is None or workflow["old_model_json"] is None:
                     raise RuntimeError("Verification requires both old and active models")
@@ -972,8 +1357,8 @@ class ForgetGraphOrchestrator:
                 reference_model, reference_predictions = fit_independent_reference(
                     features,
                     targets,
-                    alpha=self.config.alpha,
-                    random_seed=self.config.random_seed,
+                    alpha=verification_config["alpha"],
+                    random_seed=verification_config["random_seed"],
                 )
                 current_predictions = predict(current_model, features)
                 deleted_user_absent = (
@@ -986,38 +1371,38 @@ class ForgetGraphOrchestrator:
                     np.allclose(
                         current_model["coefficients"],
                         reference_model["coefficients"],
-                        rtol=self.config.rtol,
-                        atol=self.config.atol,
+                        rtol=verification_config["rtol"],
+                        atol=verification_config["atol"],
                     )
                 )
                 intercept_match = bool(
                     np.isclose(
                         current_model["intercept"],
                         reference_model["intercept"],
-                        rtol=self.config.rtol,
-                        atol=self.config.atol,
+                        rtol=verification_config["rtol"],
+                        atol=verification_config["atol"],
                     )
                 )
                 predictions_match = bool(
                     np.allclose(
                         current_predictions,
                         reference_predictions,
-                        rtol=self.config.rtol,
-                        atol=self.config.atol,
+                        rtol=verification_config["rtol"],
+                        atol=verification_config["atol"],
                     )
                 )
                 old_model_differs = not (
                     np.allclose(
                         old_model["coefficients"],
                         current_model["coefficients"],
-                        rtol=self.config.rtol,
-                        atol=self.config.atol,
+                        rtol=verification_config["rtol"],
+                        atol=verification_config["atol"],
                     )
                     and np.isclose(
                         old_model["intercept"],
                         current_model["intercept"],
-                        rtol=self.config.rtol,
-                        atol=self.config.atol,
+                        rtol=verification_config["rtol"],
+                        atol=verification_config["atol"],
                     )
                 )
                 max_reference_coefficient_abs_diff = float(
@@ -1033,6 +1418,9 @@ class ForgetGraphOrchestrator:
                 )
                 max_reference_prediction_abs_diff = float(
                     np.max(np.abs(current_predictions - reference_predictions))
+                )
+                mean_reference_prediction_abs_diff = float(
+                    np.mean(np.abs(current_predictions - reference_predictions))
                 )
                 max_old_replacement_coefficient_abs_diff = float(
                     np.max(
@@ -1073,15 +1461,22 @@ class ForgetGraphOrchestrator:
                     "predictions_match": predictions_match,
                     "old_model_differs": old_model_differs,
                     "old_model_difference_required": False,
-                    "rtol": self.config.rtol,
-                    "atol": self.config.atol,
-                    "alpha": self.config.alpha,
-                    "random_seed": self.config.random_seed,
+                    "rtol": verification_config["rtol"],
+                    "atol": verification_config["atol"],
+                    "alpha": verification_config["alpha"],
+                    "random_seed": verification_config["random_seed"],
                     "attempt_number": attempt_number,
+                    "replacement_model_id": (
+                        f"active:{model_row['generation']}"
+                    ),
+                    "reference_model_id": (
+                        f"reference:{deletion_id}:{attempt_number}"
+                    ),
                     "prediction_count": len(current_predictions),
                     "max_reference_coefficient_abs_diff": max_reference_coefficient_abs_diff,
                     "reference_intercept_abs_diff": reference_intercept_abs_diff,
                     "max_reference_prediction_abs_diff": max_reference_prediction_abs_diff,
+                    "mean_reference_prediction_abs_diff": mean_reference_prediction_abs_diff,
                     "max_prediction_abs_diff": max_reference_prediction_abs_diff,
                     "max_old_replacement_coefficient_abs_diff": max_old_replacement_coefficient_abs_diff,
                     "old_replacement_intercept_abs_diff": old_replacement_intercept_abs_diff,
@@ -1156,6 +1551,7 @@ class ForgetGraphOrchestrator:
                     ),
                     deletion_id,
                 )
+                self._refresh_deletion_certificate(connection, deletion_id)
                 return report
         except Exception as error:
             with self._connection() as connection:
@@ -1187,6 +1583,7 @@ class ForgetGraphOrchestrator:
                     ),
                     deletion_id,
                 )
+                self._refresh_deletion_certificate(connection, deletion_id)
             raise
 
     def get_verification_attempts(self, deletion_id: str) -> list[dict]:
@@ -1237,6 +1634,117 @@ class ForgetGraphOrchestrator:
         if row["verification_report_json"] is None:
             return None
         return json.loads(row["verification_report_json"])
+
+    def get_deletion_certificate(self, deletion_id: str) -> dict:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT certificate_json FROM deletion_certificates
+                WHERE deletion_id = ?
+                """,
+                (deletion_id,),
+            ).fetchone()
+            if row is None:
+                exists = connection.execute(
+                    "SELECT 1 FROM deletion_workflows WHERE deletion_id = ?",
+                    (deletion_id,),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError(f"Unknown deletion workflow: {deletion_id}")
+                raise RuntimeError(
+                    "No evidence certificate is available for this workflow"
+                )
+            return json.loads(row["certificate_json"])
+
+    def list_deletion_certificates(self, limit: int = 100) -> list[dict]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT certificate_json FROM deletion_certificates
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [json.loads(row["certificate_json"]) for row in rows]
+
+    def list_deletion_certificate_revisions(
+        self, deletion_id: str
+    ) -> list[dict]:
+        with self._connection() as connection:
+            certificate = connection.execute(
+                """
+                SELECT certificate_id FROM deletion_certificates
+                WHERE deletion_id = ?
+                """,
+                (deletion_id,),
+            ).fetchone()
+            if certificate is None:
+                exists = connection.execute(
+                    "SELECT 1 FROM deletion_workflows WHERE deletion_id = ?",
+                    (deletion_id,),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError(f"Unknown deletion workflow: {deletion_id}")
+                return []
+            rows = connection.execute(
+                """
+                SELECT revision_number, created_at, status, certificate_json,
+                       integrity_hash
+                FROM deletion_certificate_revisions
+                WHERE certificate_id = ?
+                ORDER BY revision_number
+                """,
+                (certificate["certificate_id"],),
+            ).fetchall()
+            return [
+                {
+                    "revision_number": row["revision_number"],
+                    "created_at": row["created_at"],
+                    "status": row["status"],
+                    "certificate": json.loads(row["certificate_json"]),
+                    "integrity_hash": row["integrity_hash"],
+                }
+                for row in rows
+            ]
+
+    def validate_deletion_certificate(
+        self, deletion_id: str, revision_number: int | None = None
+    ) -> dict:
+        with self._connection() as connection:
+            if revision_number is None:
+                row = connection.execute(
+                    """
+                    SELECT certificate_json, integrity_hash
+                    FROM deletion_certificates WHERE deletion_id = ?
+                    """,
+                    (deletion_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT r.certificate_json, r.integrity_hash
+                    FROM deletion_certificate_revisions AS r
+                    JOIN deletion_certificates AS c USING (certificate_id)
+                    WHERE c.deletion_id = ? AND r.revision_number = ?
+                    """,
+                    (deletion_id, revision_number),
+                ).fetchone()
+        if row is None:
+            raise KeyError(f"No evidence certificate for workflow: {deletion_id}")
+        certificate = json.loads(row["certificate_json"])
+        stored_hash = certificate.pop("integrity_hash", None)
+        calculated_hash = self._evidence_hash(certificate)
+        valid = (
+            stored_hash == calculated_hash
+            and row["integrity_hash"] == calculated_hash
+        )
+        return {
+            "valid": valid,
+            "stored_hash": row["integrity_hash"],
+            "calculated_hash": calculated_hash,
+        }
 
     def get_workflow(self, deletion_id: str) -> dict:
         with self._connection() as connection:
@@ -1362,7 +1870,7 @@ class ForgetGraphOrchestrator:
         with self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT deletion_id, requested_at, execution_status,
+                SELECT deletion_id, user_hash, requested_at, execution_status,
                        verification_status, affected_artifacts_json
                 FROM deletion_workflows
                 ORDER BY requested_at DESC LIMIT ?
@@ -1372,6 +1880,7 @@ class ForgetGraphOrchestrator:
             return [
                 {
                     "deletion_id": row["deletion_id"],
+                    "user_hash": row["user_hash"],
                     "requested_at": row["requested_at"],
                     "execution_status": row["execution_status"],
                     "verification_status": row["verification_status"],

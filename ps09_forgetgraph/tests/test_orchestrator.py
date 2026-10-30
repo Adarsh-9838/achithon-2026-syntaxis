@@ -65,6 +65,12 @@ def test_deletion_removes_user_from_source_features_and_cache(orchestrator):
     state = orchestrator.get_user_state(user_id)
     assert state == {"source": False, "features": False, "cache": False}
     assert orchestrator.get_workflow(result["deletion_id"])["verification_status"] == "PASSED"
+    saved_workflow = next(
+        row
+        for row in orchestrator.list_workflows()
+        if row["deletion_id"] == result["deletion_id"]
+    )
+    assert saved_workflow["user_hash"] == orchestrator.hash_user_id(user_id)
 
 
 def test_deletion_recomputes_aggregate_features_for_retained_users(orchestrator):
@@ -109,6 +115,133 @@ def test_replacement_matches_independent_reference_and_reports_old_difference(or
     )
 
 
+def test_successful_deletion_generates_valid_certificate_with_verification_evidence(
+    orchestrator,
+):
+    user_id = choose_deletion_user()
+    result = orchestrator.request_deletion(user_id)
+
+    certificate = orchestrator.get_deletion_certificate(result["deletion_id"])
+    revisions = orchestrator.list_deletion_certificate_revisions(result["deletion_id"])
+    validation = orchestrator.validate_deletion_certificate(result["deletion_id"])
+
+    assert certificate["certificate_id"] == result["certificate_id"]
+    assert certificate["request_id"] == result["deletion_id"]
+    assert certificate["status"] == "VERIFIED"
+    assert certificate["execution"]["status"] == "COMPLETED"
+    assert certificate["deleted_record_ids"] == [orchestrator.hash_user_id(user_id)]
+    assert certificate["execution"]["old_model_id"] == "active:1"
+    assert certificate["execution"]["replacement_model_id"] == "active:2"
+    assert {stage["stage"] for stage in certificate["execution"]["stages"]} == {
+        "remove_source",
+        "recompute_features",
+        "invalidate_cache",
+        "replace_model",
+    }
+    assert all(stage["started_at"] and stage["completed_at"] for stage in certificate["execution"]["stages"])
+    assert certificate["verification"]["result"] == "PASS"
+    assert certificate["verification"]["reference_model_id"].startswith("reference:")
+    assert certificate["verification"]["prediction_comparison"][
+        "mean_absolute_difference"
+    ] == pytest.approx(0.0, abs=1e-12)
+    assert certificate["verification"]["tolerances"] == {
+        "rtol": 1e-8,
+        "atol": 1e-10,
+    }
+    assert json.loads(json.dumps(certificate)) == certificate
+    assert validation["valid"] is True
+    assert len(revisions) >= 1
+    assert revisions[-1]["status"] == "VERIFIED"
+
+
+def test_certificate_is_incomplete_until_verification_finishes(orchestrator):
+    user_id = choose_deletion_user()
+
+    with pytest.raises(SimulatedCrash) as crash:
+        orchestrator.request_deletion(user_id, fail_after_step="recompute_features")
+
+    deletion_id = crash.value.deletion_id
+    certificate = orchestrator.get_deletion_certificate(deletion_id)
+    assert certificate["status"] == "INCOMPLETE"
+    assert certificate["verification"]["status"] == "NOT_RUN"
+    assert certificate["execution"]["status"] == "RUNNING"
+    assert orchestrator.validate_deletion_certificate(deletion_id)["valid"] is True
+
+    orchestrator.resume_workflow(deletion_id)
+    assert orchestrator.get_deletion_certificate(deletion_id)["status"] == "VERIFIED"
+
+
+def test_failed_execution_certificate_is_not_verified(orchestrator, monkeypatch):
+    user_id = choose_deletion_user()
+    original_apply_step = orchestrator._apply_step
+
+    def fail_source_removal(connection, step_name, user_hash):
+        if step_name == "remove_source":
+            raise RuntimeError("simulated source removal failure")
+        return original_apply_step(connection, step_name, user_hash)
+
+    monkeypatch.setattr(orchestrator, "_apply_step", fail_source_removal)
+    with pytest.raises(RuntimeError, match="simulated source removal failure"):
+        orchestrator.request_deletion(user_id)
+
+    with sqlite3.connect(orchestrator.database_path) as connection:
+        deletion_id = connection.execute(
+            "SELECT deletion_id FROM deletion_workflows"
+        ).fetchone()[0]
+    certificate = orchestrator.get_deletion_certificate(deletion_id)
+    assert certificate["status"] == "FAILED"
+    assert certificate["execution"]["status"] == "FAILED"
+    assert certificate["verification"]["result"] is None
+
+
+def test_tampered_certificate_payload_fails_integrity_validation(orchestrator):
+    result = orchestrator.request_deletion(choose_deletion_user())
+    with sqlite3.connect(orchestrator.database_path) as connection:
+        row = connection.execute(
+            "SELECT certificate_json FROM deletion_certificates WHERE deletion_id = ?",
+            (result["deletion_id"],),
+        ).fetchone()
+        certificate = json.loads(row[0])
+        certificate["execution"]["status"] = "FAILED"
+        connection.execute(
+            "UPDATE deletion_certificates SET certificate_json = ? WHERE deletion_id = ?",
+            (json.dumps(certificate), result["deletion_id"]),
+        )
+
+    assert orchestrator.validate_deletion_certificate(result["deletion_id"])[
+        "valid"
+    ] is False
+
+
+def test_certificate_keeps_its_replacement_model_identity_after_later_deletions(
+    orchestrator,
+):
+    first_user = choose_deletion_user()
+    first_result = orchestrator.request_deletion(first_user)
+    first_certificate = orchestrator.get_deletion_certificate(
+        first_result["deletion_id"]
+    )
+    later_user = orchestrator.get_available_user_ids(limit=2)[0]
+    orchestrator.request_deletion(later_user)
+
+    restarted = ForgetGraphOrchestrator(
+        database_path=orchestrator.database_path,
+        dataset_path=DATASET,
+        config_path=CONFIG,
+    )
+    reloaded_certificate = restarted.get_deletion_certificate(
+        first_result["deletion_id"]
+    )
+    assert (
+        reloaded_certificate["execution"]["replacement_model_id"]
+        == first_certificate["execution"]["replacement_model_id"]
+    )
+    assert (
+        reloaded_certificate["verification"]["replacement_model_id"]
+        == first_certificate["verification"]["replacement_model_id"]
+    )
+
+
 def test_verification_fails_when_replacement_model_is_tampered(orchestrator):
     user_id = choose_deletion_user()
     result = orchestrator.request_deletion(user_id)
@@ -127,9 +260,12 @@ def test_verification_fails_when_replacement_model_is_tampered(orchestrator):
 
     report = orchestrator.verify_deletion(result["deletion_id"])
     workflow = orchestrator.get_workflow(result["deletion_id"])
+    failed_certificate = orchestrator.get_deletion_certificate(result["deletion_id"])
     assert report["passed"] is False
     assert workflow["execution_status"] == "COMPLETED"
     assert workflow["verification_status"] == "FAILED"
+    assert failed_certificate["status"] == "FAILED"
+    assert failed_certificate["verification"]["result"] == "FAIL"
     with sqlite3.connect(orchestrator.database_path) as connection:
         connection.execute(
             "UPDATE models SET model_json = ? WHERE model_id = 'active'",
@@ -139,6 +275,15 @@ def test_verification_fails_when_replacement_model_is_tampered(orchestrator):
     retry_report = orchestrator.verify_deletion(result["deletion_id"])
     attempts = orchestrator.get_verification_attempts(result["deletion_id"])
     assert retry_report["passed"] is True
+    assert orchestrator.get_deletion_certificate(result["deletion_id"])[
+        "status"
+    ] == "VERIFIED"
+    assert [
+        revision["status"]
+        for revision in orchestrator.list_deletion_certificate_revisions(
+            result["deletion_id"]
+        )
+    ].count("FAILED") >= 1
     assert [attempt["status"] for attempt in attempts] == ["PASSED", "FAILED", "PASSED"]
     assert orchestrator.get_workflow(result["deletion_id"])["execution_status"] == "COMPLETED"
     assert orchestrator.get_workflow(result["deletion_id"])["verification_status"] == "PASSED"
@@ -223,7 +368,12 @@ def test_repeated_deletion_is_a_no_op(orchestrator):
 
     assert second["already_deleted"] is True
     assert second["deletion_id"] == first["deletion_id"]
+    assert second["certificate_id"] == first["certificate_id"]
     assert orchestrator.get_database_counts() == before
+    with sqlite3.connect(orchestrator.database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM deletion_certificates"
+        ).fetchone()[0] == 1
 
 
 def test_unknown_user_is_rejected_without_creating_a_workflow(orchestrator):
@@ -276,6 +426,9 @@ def test_verification_exception_can_be_retried_without_changing_execution(
     attempts = orchestrator.get_verification_attempts(deletion_id)
     assert [attempt["status"] for attempt in attempts] == ["FAILED"]
     assert "temporary reference trainer failure" in attempts[0]["error_text"]
+    incomplete_certificate = orchestrator.get_deletion_certificate(deletion_id)
+    assert incomplete_certificate["status"] == "INCOMPLETE"
+    assert incomplete_certificate["verification"]["result"] is None
 
     monkeypatch.setattr(orchestrator_module, "fit_independent_reference", real_fit)
     report = orchestrator.verify_deletion(deletion_id)
@@ -285,6 +438,7 @@ def test_verification_exception_can_be_retried_without_changing_execution(
     assert [attempt["status"] for attempt in attempts] == ["FAILED", "PASSED"]
     assert orchestrator.get_workflow(deletion_id)["execution_status"] == "COMPLETED"
     assert orchestrator.get_workflow(deletion_id)["verification_status"] == "PASSED"
+    assert orchestrator.get_deletion_certificate(deletion_id)["status"] == "VERIFIED"
     events = orchestrator.get_audit_events(limit=20)
     event_types = [event["event_type"] for event in events]
     assert event_types.count("verification_attempt_started") == 2
