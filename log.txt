@@ -372,3 +372,22 @@ branch=ps09-forgetgraph
 repo_root=C:\PROJECTS\Syntaxis\achithon-2026-syntaxis
 worktree=main
 parent_agent=none
+## [2026-10-30T14:30:56.668+05:30] Explaining how to test the app
+
+User Prompt (verbatim, secrets redacted):
+how to test it
+
+Agent Response Summary:
+Provided a simple manual browser walkthrough using a fresh synthetic user, expected successful workflow and verification outcomes, repeat-request and invalid-ID checks, and optional crash/recovery exercise. Included the exact PowerShell command to run pytest.
+
+Actions:
+* Appended this user-turn entry to the root log.txt.
+* Committed the append-only logging update.
+
+Context:
+tool=GitHub Copilot
+problem_id=PS09
+branch=ps09-forgetgraph
+repo_root=C:\PROJECTS\Syntaxis\achithon-2026-syntaxis
+worktree=main
+parent_agent=none
