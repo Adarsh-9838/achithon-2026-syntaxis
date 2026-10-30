@@ -225,6 +225,20 @@ class ForgetGraphOrchestrator:
                 created_at TEXT NOT NULL
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS verification_attempts (
+                attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                deletion_id TEXT NOT NULL REFERENCES deletion_workflows(deletion_id),
+                attempt_number INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                status TEXT NOT NULL
+                    CHECK (status IN ('RUNNING','PASSED','FAILED')),
+                report_json TEXT,
+                error_text TEXT,
+                UNIQUE (deletion_id, attempt_number)
+            )
+            """,
         )
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
@@ -847,13 +861,70 @@ class ForgetGraphOrchestrator:
                 raise KeyError(f"Unknown deletion workflow: {deletion_id}")
             if workflow["execution_status"] != "COMPLETED":
                 raise ValueError("Cannot verify a workflow before execution completes")
+            interrupted_attempts = connection.execute(
+                """
+                SELECT attempt_number FROM verification_attempts
+                WHERE deletion_id = ? AND status = 'RUNNING'
+                """,
+                (deletion_id,),
+            ).fetchall()
+            for interrupted in interrupted_attempts:
+                interruption = "Superseded by retry after interrupted verification"
+                connection.execute(
+                    """
+                    UPDATE verification_attempts
+                    SET completed_at = ?, status = 'FAILED', error_text = ?
+                    WHERE deletion_id = ? AND attempt_number = ?
+                    """,
+                    (
+                        self._now(),
+                        interruption,
+                        deletion_id,
+                        interrupted["attempt_number"],
+                    ),
+                )
+                self._record_audit(
+                    connection,
+                    "verification_attempt_interrupted",
+                    json.dumps(
+                        {
+                            "attempt_number": interrupted["attempt_number"],
+                            "reason": interruption,
+                        },
+                        sort_keys=True,
+                    ),
+                    deletion_id,
+                )
+            attempt_number = connection.execute(
+                """
+                SELECT COALESCE(MAX(attempt_number), 0) + 1
+                FROM verification_attempts WHERE deletion_id = ?
+                """,
+                (deletion_id,),
+            ).fetchone()[0]
+            started_at = self._now()
+            connection.execute(
+                """
+                INSERT INTO verification_attempts
+                (deletion_id, attempt_number, started_at, status)
+                VALUES (?, ?, ?, 'RUNNING')
+                """,
+                (deletion_id, attempt_number, started_at),
+            )
             connection.execute(
                 """
                 UPDATE deletion_workflows
-                SET verification_status = 'RUNNING', verification_report_json = NULL
+                SET verification_status = 'RUNNING',
+                    verification_report_json = NULL, error_text = NULL
                 WHERE deletion_id = ?
                 """,
                 (deletion_id,),
+            )
+            self._record_audit(
+                connection,
+                "verification_attempt_started",
+                json.dumps({"attempt_number": attempt_number}, sort_keys=True),
+                deletion_id,
             )
 
         try:
@@ -881,6 +952,13 @@ class ForgetGraphOrchestrator:
                         "SELECT user_hash FROM prediction_cache"
                     ).fetchall()
                 }
+                tombstone_present = (
+                    connection.execute(
+                        "SELECT 1 FROM tombstones WHERE user_hash = ?",
+                        (user_hash,),
+                    ).fetchone()
+                    is not None
+                )
                 model_row = connection.execute(
                     "SELECT model_json FROM models WHERE model_id = 'active'"
                 ).fetchone()
@@ -942,6 +1020,31 @@ class ForgetGraphOrchestrator:
                         atol=self.config.atol,
                     )
                 )
+                max_reference_coefficient_abs_diff = float(
+                    np.max(
+                        np.abs(
+                            np.asarray(current_model["coefficients"])
+                            - np.asarray(reference_model["coefficients"])
+                        )
+                    )
+                )
+                reference_intercept_abs_diff = abs(
+                    current_model["intercept"] - reference_model["intercept"]
+                )
+                max_reference_prediction_abs_diff = float(
+                    np.max(np.abs(current_predictions - reference_predictions))
+                )
+                max_old_replacement_coefficient_abs_diff = float(
+                    np.max(
+                        np.abs(
+                            np.asarray(old_model["coefficients"])
+                            - np.asarray(current_model["coefficients"])
+                        )
+                    )
+                )
+                old_replacement_intercept_abs_diff = abs(
+                    old_model["intercept"] - current_model["intercept"]
+                )
                 counts_after = self._count_records(connection)
                 counts_before = json.loads(workflow["counts_before_json"])
                 cache_step = connection.execute(
@@ -955,27 +1058,33 @@ class ForgetGraphOrchestrator:
                     "passed": all(
                         (
                             deleted_user_absent,
+                            tombstone_present,
                             features_match_source,
                             coefficients_match,
                             intercept_match,
                             predictions_match,
-                            old_model_differs,
                         )
                     ),
                     "deleted_user_absent": deleted_user_absent,
+                    "tombstone_present": tombstone_present,
                     "features_match_source": features_match_source,
                     "coefficients_match": coefficients_match,
                     "intercept_match": intercept_match,
                     "predictions_match": predictions_match,
                     "old_model_differs": old_model_differs,
+                    "old_model_difference_required": False,
                     "rtol": self.config.rtol,
                     "atol": self.config.atol,
                     "alpha": self.config.alpha,
                     "random_seed": self.config.random_seed,
+                    "attempt_number": attempt_number,
                     "prediction_count": len(current_predictions),
-                    "max_prediction_abs_diff": float(
-                        np.max(np.abs(current_predictions - reference_predictions))
-                    ),
+                    "max_reference_coefficient_abs_diff": max_reference_coefficient_abs_diff,
+                    "reference_intercept_abs_diff": reference_intercept_abs_diff,
+                    "max_reference_prediction_abs_diff": max_reference_prediction_abs_diff,
+                    "max_prediction_abs_diff": max_reference_prediction_abs_diff,
+                    "max_old_replacement_coefficient_abs_diff": max_old_replacement_coefficient_abs_diff,
+                    "old_replacement_intercept_abs_diff": old_replacement_intercept_abs_diff,
                     "counts_before": counts_before,
                     "counts_after": counts_after,
                     "cache_invalidation_count": (
@@ -997,11 +1106,11 @@ class ForgetGraphOrchestrator:
                         key
                         for key, passed in (
                             ("deleted_user_absent", deleted_user_absent),
+                            ("tombstone_present", tombstone_present),
                             ("features_match_source", features_match_source),
                             ("coefficients_match", coefficients_match),
                             ("intercept_match", intercept_match),
                             ("predictions_match", predictions_match),
-                            ("old_model_differs", old_model_differs),
                         )
                         if not passed
                     ],
@@ -1020,11 +1129,26 @@ class ForgetGraphOrchestrator:
                         deletion_id,
                     ),
                 )
+                connection.execute(
+                    """
+                    UPDATE verification_attempts
+                    SET completed_at = ?, status = ?, report_json = ?
+                    WHERE deletion_id = ? AND attempt_number = ?
+                    """,
+                    (
+                        self._now(),
+                        verification_status,
+                        json.dumps(report, sort_keys=True),
+                        deletion_id,
+                        attempt_number,
+                    ),
+                )
                 self._record_audit(
                     connection,
-                    "verification_completed",
+                    "verification_attempt_completed",
                     json.dumps(
                         {
+                            "attempt_number": attempt_number,
                             "verification_status": verification_status,
                             "failure_reasons": report["failure_reasons"],
                         },
@@ -1043,13 +1167,61 @@ class ForgetGraphOrchestrator:
                     """,
                     (str(error), deletion_id),
                 )
+                connection.execute(
+                    """
+                    UPDATE verification_attempts
+                    SET completed_at = ?, status = 'FAILED', error_text = ?
+                    WHERE deletion_id = ? AND attempt_number = ?
+                    """,
+                    (self._now(), str(error), deletion_id, attempt_number),
+                )
                 self._record_audit(
                     connection,
-                    "verification_error",
-                    str(error),
+                    "verification_attempt_failed",
+                    json.dumps(
+                        {
+                            "attempt_number": attempt_number,
+                            "error": str(error),
+                        },
+                        sort_keys=True,
+                    ),
                     deletion_id,
                 )
             raise
+
+    def get_verification_attempts(self, deletion_id: str) -> list[dict]:
+        with self._connection() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM deletion_workflows WHERE deletion_id = ?",
+                (deletion_id,),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(f"Unknown deletion workflow: {deletion_id}")
+            rows = connection.execute(
+                """
+                SELECT attempt_number, started_at, completed_at, status,
+                       report_json, error_text
+                FROM verification_attempts
+                WHERE deletion_id = ?
+                ORDER BY attempt_number
+                """,
+                (deletion_id,),
+            ).fetchall()
+            return [
+                {
+                    "attempt_number": row["attempt_number"],
+                    "started_at": row["started_at"],
+                    "completed_at": row["completed_at"],
+                    "status": row["status"],
+                    "report": (
+                        json.loads(row["report_json"])
+                        if row["report_json"] is not None
+                        else None
+                    ),
+                    "error_text": row["error_text"],
+                }
+                for row in rows
+            ]
 
     def get_verification_report(self, deletion_id: str) -> dict | None:
         with self._connection() as connection:
@@ -1118,6 +1290,34 @@ class ForgetGraphOrchestrator:
                 ).fetchone()
                 is not None,
             }
+
+    def get_available_user_ids(self, limit: int = 20) -> list[str]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        dataset = pd.read_csv(self.dataset_path, usecols=["user_id"])
+        with self._connection() as connection:
+            active_hashes = {
+                row["user_hash"]
+                for row in connection.execute(
+                    "SELECT user_hash FROM source_records"
+                ).fetchall()
+            }
+        return [
+            str(user_id)
+            for user_id in dataset["user_id"]
+            if self.hash_user_id(user_id) in active_hashes
+        ][:limit]
+
+    def is_tombstoned(self, user_id: str) -> bool:
+        user_hash = self.hash_user_id(user_id)
+        with self._connection() as connection:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM tombstones WHERE user_hash = ?",
+                    (user_hash,),
+                ).fetchone()
+                is not None
+            )
 
     def get_feature_row(self, user_id: str) -> dict | None:
         user_hash = self.hash_user_id(user_id)

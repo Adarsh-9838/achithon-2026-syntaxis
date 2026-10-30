@@ -468,3 +468,42 @@ branch=ps09-forgetgraph
 repo_root=C:\PROJECTS\Syntaxis\achithon-2026-syntaxis
 worktree=main
 parent_agent=none
+## [2026-10-30T15:12:40.922+05:30] Hardening PS09 verification and demo
+
+User Prompt (verbatim, secrets redacted):
+Review and improve the existing PS09 FORGETGRAPH project against PS09.md and the attached Generalized Agent Trace Instructions. First inspect the current repository and preserve unrelated files and user changes. Do not claim completion until you have run the project’s tests and verified the dashboard.
+
+Prioritize these correctness fixes:
+1. Make verification-only failures recoverable after execution completes. Add a clear retry-verification operation/UI control that preserves execution status and records each verification attempt/audit event.
+2. Remove the requirement that the replacement model must differ from the old model for verification to pass. PS09 requires agreement between the replacement and an independently trained reference, not necessarily different model parameters. Keep reporting old/new differences as evidence, not as a required pass condition.
+3. Define and test database-reset/reinitialization behavior. Ensure the documentation accurately explains that rebuilding from the original synthetic CSV can reintroduce deleted IDs, or implement a safe persistent tombstone approach if reset-safe prevention is in scope. Never imply tombstones survive deletion of the database unless they actually do.
+4. Add tests for ordinary failures at each workflow stage, retry/resume behavior, verification exceptions/retries, and no false success status. Keep the existing crash-recovery, tombstone, lineage, model-comparison, and dashboard tests.
+5. Either serialize/guard concurrent request and resume operations for a workflow and test them, or explicitly document and surface the single-process/single-user limitation.
+
+Then improve judge-facing demo quality without adding unnecessary complexity:
+- Add a short guided demo flow using a synthetic user, showing before counts, impacted artifacts, each workflow stage, after counts, tombstone/re-ingestion rejection, and independent verification evidence.
+- Make execution status and verification status visually distinct, including clear failed/retryable states.
+- Show numerical tolerances and measured maximum coefficient/intercept/prediction differences in the report.
+- Add a concise README demo script with expected outcomes and exact test/run commands.
+- Ensure all dashboard claims match actual backend behavior.
+
+Follow the attached trace instructions: identify relevant PS09 agent sessions, preserve native traces where available, exclude credentials/unrelated sessions, redact secrets and sensitive PII without falsifying records, and create the specified trace layout/archive only if required by the active submission rules. Do not claim the trace requirement is met if traces cannot be exported; document that limitation.
+
+After changes, run the full pytest suite in the project’s own virtual environment, verify Streamlit starts/renders, inspect git status to ensure only intended files changed, and report what was changed, exact test results, remaining limitations, and whether the trace artifact was actually prepared.
+
+Agent Response Summary:
+Added durable verification-attempt records and audit events, a retry-verification API/UI flow that leaves execution status intact, and recovery for abandoned verification attempts. Updated verification so old/new model differences are informational, recorded coefficient/intercept/prediction deltas, and tested failures/retries for each workflow stage, verification exceptions, tampering, reset semantics, and equal old/replacement models. Added a guided synthetic deletion demo and documented the single-user concurrency and database-reset boundaries. All 20 tests passed, compilation succeeded, and the dashboard rendered in AppTest and responded to a live HTTP health check. PS09 does not require a trace archive; native local session records were left untouched, and no trace package was created.
+
+Actions:
+* Updated ps09_forgetgraph/src/forgetgraph/orchestrator.py, tests, app.py, README.md, and SPEC.md.
+* Ran the full suite in the project virtual environment: 20 passed.
+* Ran Python compilation, Streamlit AppTest, live Streamlit startup, and HTTP health check.
+* Checked PS09 trace requirements and relevant local session records; did not export or alter native traces.
+
+Context:
+tool=GitHub Copilot
+problem_id=PS09
+branch=ps09-forgetgraph
+repo_root=C:\PROJECTS\Syntaxis\achithon-2026-syntaxis
+worktree=main
+parent_agent=none

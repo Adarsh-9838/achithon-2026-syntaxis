@@ -1,3 +1,4 @@
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -9,6 +10,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_DIR / "src"))
 
 from forgetgraph import (  # noqa: E402
+    DeletedUserError,
     ForgetGraphOrchestrator,
     SimulatedCrash,
     UnknownUserError,
@@ -250,6 +252,7 @@ with st.sidebar:
     st.divider()
     st.caption("Local demo · SQLite persistence · Synthetic records")
     st.caption("No external API calls or credentials")
+    st.warning("Single-process, single-user demo. Do not run overlapping requests.")
 
 st.markdown('<div class="fg-eyebrow">DATA LIFECYCLE GOVERNANCE</div>', unsafe_allow_html=True)
 st.title("Deletion operations")
@@ -259,8 +262,14 @@ st.markdown(
 )
 st.write("")
 
-overview_tab, deletion_tab, verification_tab, audit_tab = st.tabs(
-    ["Overview", "Deletion workflow", "Verification & security", "Audit trail"]
+overview_tab, deletion_tab, verification_tab, guided_demo_tab, audit_tab = st.tabs(
+    [
+        "Overview",
+        "Deletion workflow",
+        "Verification & security",
+        "Guided demo",
+        "Audit trail",
+    ]
 )
 
 with overview_tab:
@@ -309,6 +318,10 @@ with overview_tab:
                 st.caption(f"Workflow `{latest['deletion_id'][:8]}`")
             else:
                 st.info("No deletion requests yet. Start one in the Deletion workflow tab.")
+    st.warning(
+        "Concurrency boundary: this SQLite prototype supports one process and one "
+        "user at a time; it does not lock concurrent deletion or resume requests."
+    )
 
 with deletion_tab:
     section_heading(
@@ -484,6 +497,155 @@ with deletion_tab:
                 f"atol={report['atol']:.1e}."
             )
 
+with guided_demo_tab:
+    section_heading(
+        "Guided synthetic deletion",
+        "Walk through a real persisted deletion using one synthetic user. The selected ID is permanently deleted from this demo database.",
+    )
+    st.markdown(
+        "1. Preview live counts and lineage impact.  "
+        "2. Run the four persisted stages.  "
+        "3. Review before/after counts and independent model evidence.  "
+        "4. Attempt managed re-ingestion to see the tombstone guard reject it."
+    )
+    active_ids = orchestrator.get_available_user_ids(limit=700)
+    previous_demo_user = st.session_state.get("guided_demo_user_id")
+    demo_options = list(active_ids)
+    if previous_demo_user and previous_demo_user not in demo_options:
+        demo_options.insert(0, previous_demo_user)
+    if not demo_options:
+        st.info("No active synthetic IDs remain for a new guided deletion.")
+    else:
+        selected_demo_user = st.selectbox(
+            "Synthetic user for this demonstration",
+            demo_options,
+            key="guided_demo_user_id",
+        )
+        demo_state = orchestrator.get_user_state(selected_demo_user)
+        demo_counts = orchestrator.get_database_counts()
+        demo_impacts = orchestrator.get_affected_artifacts(selected_demo_user)
+        preview_columns = st.columns(4)
+        for column, key, label in zip(
+            preview_columns,
+            ("source_records", "feature_rows", "prediction_cache", "tombstones"),
+            ("Source before", "Features before", "Cache before", "Tombstones"),
+        ):
+            column.metric(label, f"{demo_counts[key]:,}")
+        st.markdown(
+            "**Recorded impacted artifacts:** "
+            + (", ".join(sorted(demo_impacts)) if demo_impacts else "none")
+        )
+        st.graphviz_chart(
+            graphviz_source(graph, set(demo_impacts)),
+            width="stretch",
+        )
+        if st.button(
+            "Run guided deletion",
+            type="primary",
+            disabled=not demo_state["source"],
+            key="run-guided-deletion",
+        ):
+            result = orchestrator.request_deletion(selected_demo_user)
+            st.session_state["guided_demo_deletion_id"] = result["deletion_id"]
+            st.rerun()
+
+        demo_deletion_id = st.session_state.get("guided_demo_deletion_id")
+        if demo_deletion_id:
+            demo_workflow = orchestrator.get_workflow(demo_deletion_id)
+            demo_report = orchestrator.get_verification_report(demo_deletion_id)
+            st.markdown("---")
+            st.subheader("Persisted stage-by-stage execution")
+            st.caption(
+                f"Execution: {status_emoji(demo_workflow['execution_status'])} "
+                f"{demo_workflow['execution_status']}  ·  "
+                f"Verification: {status_emoji(demo_workflow['verification_status'])} "
+                f"{demo_workflow['verification_status']}"
+            )
+            step_columns = st.columns(max(len(demo_workflow["steps"]), 1))
+            for column, step in zip(step_columns, demo_workflow["steps"]):
+                with column:
+                    st.markdown(
+                        f"**{step['step_order']}. "
+                        f"{step['step_name'].replace('_', ' ').title()}**"
+                    )
+                    st.write(f"{status_emoji(step['status'])} {step['status']}")
+                    st.caption(f"Effects: {step['effect_count']:,}")
+            if demo_report:
+                st.markdown("#### Before / after counts")
+                count_columns = st.columns(3)
+                for column, artifact, label in zip(
+                    count_columns,
+                    ("source_records", "feature_rows", "prediction_cache"),
+                    ("Source records", "Feature rows", "Cached predictions"),
+                ):
+                    before_count = demo_report["counts_before"].get(artifact, 0)
+                    after_count = demo_report["counts_after"].get(artifact, 0)
+                    column.metric(
+                        label,
+                        f"{after_count:,}",
+                        delta=f"{after_count - before_count:,}",
+                    )
+                st.write(
+                    f"Cache invalidation removed "
+                    f"**{demo_report['cache_invalidation_count']:,}** predictions. "
+                    f"Tombstone present: **{demo_report['tombstone_present']}**."
+                )
+                if demo_report["passed"]:
+                    st.success(
+                        "Independent reference verification passed; the old/new "
+                        "difference is evidence, not a pass condition."
+                    )
+                else:
+                    st.error(
+                        "Independent verification failed: "
+                        + ", ".join(demo_report["failure_reasons"])
+                    )
+                st.caption(
+                    f"rtol={demo_report['rtol']:.1e}, "
+                    f"atol={demo_report['atol']:.1e}; maximum absolute replacement/reference "
+                    f"differences: coefficients="
+                    f"{demo_report['max_reference_coefficient_abs_diff']:.3e}, "
+                    f"intercept={demo_report['reference_intercept_abs_diff']:.3e}, "
+                    f"predictions={demo_report['max_reference_prediction_abs_diff']:.3e}."
+                )
+                st.write(
+                    "Old model differs from replacement: "
+                    f"**{demo_report['old_model_differs']}** "
+                    "(reported as evidence only)."
+                )
+                if demo_workflow["execution_status"] == "COMPLETED":
+                    if st.button(
+                        "Test managed re-ingestion guard",
+                        key=f"test-ingest-{demo_deletion_id}",
+                    ):
+                        original = (
+                            pd.read_csv(orchestrator.dataset_path)
+                            .set_index("user_id")
+                            .loc[selected_demo_user]
+                        )
+                        record = {
+                            "user_id": selected_demo_user,
+                            "region": original["region"],
+                            "signal_a": original["signal_a"],
+                            "signal_b": original["signal_b"],
+                            "target": original["target"],
+                        }
+                        counts_before_ingestion = orchestrator.get_database_counts()
+                        try:
+                            orchestrator.ingest_record(record)
+                        except DeletedUserError:
+                            if orchestrator.get_database_counts() != counts_before_ingestion:
+                                st.error("Guard raised, but database counts changed unexpectedly.")
+                            else:
+                                st.success(
+                                    "Managed ingestion rejected the tombstoned ID; "
+                                    "database counts were unchanged."
+                                )
+                        else:
+                            st.error(
+                                "The managed ingestion guard accepted a deleted ID."
+                            )
+
 with verification_tab:
     section_heading(
         "Independent verification",
@@ -511,25 +673,85 @@ with verification_tab:
             for row in workflow_rows
             if row["deletion_id"] == selected_for_report
         )
+        selected_workflow = orchestrator.get_workflow(selected_for_report)
         report = orchestrator.get_verification_report(selected_for_report)
+        current_report_fields = {
+            "tombstone_present",
+            "max_reference_coefficient_abs_diff",
+            "reference_intercept_abs_diff",
+            "max_reference_prediction_abs_diff",
+            "max_old_replacement_coefficient_abs_diff",
+            "old_replacement_intercept_abs_diff",
+        }
+        legacy_report = report is not None and not current_report_fields.issubset(
+            report
+        )
         left, right = st.columns(2)
-        left.metric("Execution", orchestrator.get_workflow(selected_for_report)["execution_status"])
-        right.metric("Verification", selected_status)
+        left.metric(
+            "Execution status",
+            f"{status_emoji(selected_workflow['execution_status'])} "
+            f"{selected_workflow['execution_status']}",
+        )
+        right.metric(
+            "Verification status",
+            f"{status_emoji(selected_status)} {selected_status}",
+        )
+        if (
+            selected_workflow["execution_status"] == "COMPLETED"
+            and (selected_status != "PASSED" or legacy_report)
+            and st.button(
+                "Retry verification",
+                key=f"retry-verification-{selected_for_report}",
+                type="primary",
+            )
+        ):
+            try:
+                orchestrator.verify_deletion(selected_for_report)
+            except (RuntimeError, ValueError, sqlite3.Error) as error:
+                st.session_state["verification_retry_notice"] = str(error)
+            else:
+                st.session_state["verification_retry_notice"] = (
+                    "Verification attempt completed; review the new persisted result below."
+                )
+            st.rerun()
+        retry_notice = st.session_state.pop("verification_retry_notice", None)
+        if retry_notice:
+            st.info(retry_notice)
         if report is None:
-            st.info("Verification has not produced a report for this workflow.")
+            if selected_status == "FAILED":
+                st.error(
+                    "The latest verification attempt failed before producing a report. "
+                    "Execution remains complete; retry after resolving the reported issue."
+                )
+            else:
+                st.info("Verification has not produced a report for this workflow.")
         else:
             if report["passed"]:
                 st.success("All deletion and independent model verification checks passed.")
             else:
                 st.error("Verification failed: " + ", ".join(report["failure_reasons"]))
+            if legacy_report:
+                st.info(
+                    "This saved report predates the current evidence fields. "
+                    "Retry verification to persist tombstone and coefficient/intercept deltas."
+                )
             check_rows = [
                 {"Check": "Deleted ID absent from source, features, and cache", "Result": report["deleted_user_absent"]},
                 {"Check": "Feature membership matches retained source", "Result": report["features_match_source"]},
                 {"Check": "Replacement coefficients match reference", "Result": report["coefficients_match"]},
                 {"Check": "Replacement intercept matches reference", "Result": report["intercept_match"]},
                 {"Check": "Retained-user predictions match reference", "Result": report["predictions_match"]},
-                {"Check": "Replacement differs from old model", "Result": report["old_model_differs"]},
             ]
+            if "tombstone_present" in report:
+                check_rows.append(
+                    {"Check": "Tombstone remains present", "Result": report["tombstone_present"]}
+                )
+            check_rows.append(
+                {
+                    "Check": "Old model differs (evidence only; not required)",
+                    "Result": report["old_model_differs"],
+                }
+            )
             st.dataframe(
                 pd.DataFrame(check_rows),
                 hide_index=True,
@@ -568,10 +790,67 @@ with verification_tab:
                     "Independent reference": st.column_config.NumberColumn(format="%.10f"),
                 },
             )
-            evidence_columns = st.columns(3)
-            evidence_columns[0].metric("Numerical tolerance", f"{report['atol']:.1e} atol")
-            evidence_columns[1].metric("Max prediction delta", f"{report['max_prediction_abs_diff']:.2e}")
-            evidence_columns[2].metric("Training setup", f"Ridge α={report['alpha']}, seed={report['random_seed']}")
+            if not legacy_report:
+                evidence_columns = st.columns(5)
+                evidence_columns[0].metric("Relative tolerance", f"{report['rtol']:.1e} rtol")
+                evidence_columns[1].metric("Absolute tolerance", f"{report['atol']:.1e} atol")
+                evidence_columns[2].metric(
+                    "Max coefficient delta",
+                    f"{report['max_reference_coefficient_abs_diff']:.2e}",
+                    help="Maximum absolute replacement/reference coefficient difference.",
+                )
+                evidence_columns[3].metric(
+                    "Intercept delta",
+                    f"{report['reference_intercept_abs_diff']:.2e}",
+                    help="Absolute replacement/reference intercept difference.",
+                )
+                evidence_columns[4].metric(
+                    "Max prediction delta",
+                    f"{report['max_reference_prediction_abs_diff']:.2e}",
+                    help="Maximum absolute retained-user replacement/reference prediction difference.",
+                )
+                st.caption(
+                    f"Old-to-replacement evidence (not a pass condition): maximum "
+                    f"coefficient delta "
+                    f"{report['max_old_replacement_coefficient_abs_diff']:.2e}; "
+                    f"intercept delta {report['old_replacement_intercept_abs_diff']:.2e}. "
+                    f"Ridge α={report['alpha']}, seed={report['random_seed']}."
+                )
+            else:
+                legacy_evidence = st.columns(3)
+                legacy_evidence[0].metric(
+                    "Relative tolerance", f"{report['rtol']:.1e} rtol"
+                )
+                legacy_evidence[1].metric(
+                    "Absolute tolerance", f"{report['atol']:.1e} atol"
+                )
+                if "max_prediction_abs_diff" in report:
+                    legacy_evidence[2].metric(
+                        "Max prediction delta",
+                        f"{report['max_prediction_abs_diff']:.2e}",
+                    )
+
+        attempts = orchestrator.get_verification_attempts(selected_for_report)
+        st.markdown("#### Verification attempt history")
+        if attempts:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Attempt": attempt["attempt_number"],
+                            "Status": attempt["status"],
+                            "Started": attempt["started_at"],
+                            "Completed": attempt["completed_at"],
+                            "Error": attempt["error_text"],
+                        }
+                        for attempt in attempts
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.caption("No verification attempts have been recorded.")
 
     st.markdown("---")
     section_heading(
@@ -596,6 +875,12 @@ with verification_tab:
             "Status": "Implemented",
             "Evidence": "Tombstoned requests return already deleted without new workflow effects.",
             "Boundary": "Concurrent multi-host orchestration is outside this local prototype.",
+        },
+        {
+            "Control": "Concurrency boundary",
+            "Status": "Single user / process only",
+            "Evidence": "SQLite transactions persist individual state changes.",
+            "Boundary": "No workflow lock; simultaneous requests or resumes are unsupported.",
         },
         {
             "Control": "Database query handling",

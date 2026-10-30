@@ -17,8 +17,8 @@ and audit history.
 The replacement model's execution status is distinct from its verification
 status. Verification checks deleted-user absence from all applicable data
 artifacts, feature/source consistency, and replacement-model agreement with
-an independently implemented reference fit. It also checks that the new model
-differs from the saved old model.
+an independently implemented reference fit. Old-to-replacement model
+differences are reported as evidence, but are not a required pass condition.
 
 The dashboard presents an overview and lineage graph, an impact preview and
 deletion workspace, independent verification evidence, a security-controls
@@ -40,6 +40,8 @@ matrix that explicitly identifies production gaps, and an audit-event view.
 - `deletion_workflows`, `workflow_steps`: execution state, separate
   verification state, affected artifact snapshot, old-model snapshot, ordered
   idempotent operations, and effect counts.
+- `verification_attempts`: a durable record for each verification run,
+  including start/completion time, result or exception, and attempt number.
 - `audit_events`: append-only operational events with timestamps and details.
 
 SQLite transactions make each data mutation and its step-completion update
@@ -80,7 +82,10 @@ from a hard-coded affected-artifact list.
    ones without duplicating effects.
 5. Once all operations complete, set execution `COMPLETED`, independently
    verify the result, and persist `PASSED` or `FAILED` without changing the
-   execution status.
+   execution status. Every attempt has a persisted start, outcome, and audit
+   event. Exceptions and failed comparisons leave execution completed and
+   verification retryable. A retry marks a stranded `RUNNING` attempt failed
+   before starting a new numbered attempt.
 6. Managed ingestion checks tombstones and refuses a deleted identifier
    before any database write.
 
@@ -97,9 +102,24 @@ The reference module imports no orchestrator training code and independently
 fits its own scaler and Ridge model on the same retained features, alpha, and
 seed. Verification compares replacement and reference coefficients,
 intercept, and predictions with `rtol=1e-8` and `atol=1e-10`. It reports each
-comparison, the configured tolerances, and whether the replacement differs
-from the previous model. It also fails on deleted-ID reappearance or
-inconsistent source/feature membership.
+comparison, the configured tolerances, maximum absolute coefficient,
+intercept, and prediction differences, and whether the replacement differs
+from the previous model. The old-model difference is evidence only. It also
+fails on a missing tombstone, deleted-ID reappearance, or inconsistent
+source/feature membership.
+
+## Database reset and concurrency boundaries
+
+Tombstones and workflow history are stored only in the SQLite database.
+Deleting that database and constructing a new orchestrator seeds all 700 IDs
+from the original CSV again; previous tombstones do not survive. Reset
+semantics are tested using a temporary database only. Do not reset the
+application database when persistent tombstone behavior is being demonstrated.
+
+The prototype does not implement a workflow-level lock. It is explicitly
+single-process and single-user; overlapping deletion, resume, or verification
+requests are unsupported. Individual state mutations use SQLite transactions,
+but that is not a concurrency guarantee for an entire workflow.
 
 ## Assumptions
 
@@ -112,6 +132,8 @@ inconsistent source/feature membership.
   prediction, while feature recomputation can affect every member of a region.
 - A simulated crash is injected only after a step's committed transaction;
   ordinary exceptions exercise the persisted `FAILED` state.
+- The demo is single-process/single-user; cross-process locking and
+  distributed coordination are outside this scope.
 - The project is self-contained under `ps09_forgetgraph/`; the existing
   repository-level virtual environment and all other problem materials are
   left untouched.
@@ -120,7 +142,12 @@ inconsistent source/feature membership.
 
 Pytest covers lineage-based artifact identification; source, feature, and
 cache deletion; correct aggregate recomputation for retained users;
-independent-reference numerical agreement; old/new model difference; tamper
-and re-insertion verification failures; status independence; repeated-request
-no-op behavior; ingestion rejection; and crash/restart idempotency.
-Dashboard startup is checked separately from the unit suite.
+independent-reference numerical agreement; old-model comparison as
+non-mandatory evidence; tamper and re-insertion verification failures;
+verification exceptions, explicit retries, abandoned-attempt recovery, and
+audit history; passing verification when old and replacement models are
+equal; status independence; repeated-request no-op behavior; ingestion
+rejection; ordinary failure and resume at every workflow step; crash/restart
+idempotency; and database reinitialization from the source CSV. Dashboard
+sections, including the guided demo and retry control, are checked separately
+from the unit suite.
